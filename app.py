@@ -118,7 +118,6 @@ def auditoria_lote_divergencias(xml_files):
                         regra_pis_cofins = 'MONOFÁSICO'
                         base_icms = f"ST Bebidas Frias -> {config_uf['Geral_ST']}"
                         base_federal = 'Tabela 4.3.10 SPED (Cód. 104 - Bebidas / Lei nº 13.097/15)'
-        else:
+              else:
             regra_icms = 'NÃO MAPEADO'
             regra_pis_cofins = 'NÃO MAPEADO'
-
