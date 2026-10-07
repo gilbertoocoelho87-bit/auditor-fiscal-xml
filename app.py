@@ -129,4 +129,4 @@ def auditoria_lote_divergencias(xml_files):
                     elif grupo_2d == '24':
                         regra_icms = 'ST'
                         regra_pis_cofins = 'MONOFÁSICO'
-                        base_icms = f"Regime ST Cigarros e Fumo -> {config_uf['Geral_ST']}"
+
