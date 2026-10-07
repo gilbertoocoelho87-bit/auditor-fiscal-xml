@@ -118,10 +118,7 @@ def auditoria_lote_divergencias(xml_files):
                         regra_pis_cofins = 'MONOFÁSICO'
                         base_icms = f"ST Bebidas Frias -> {config_uf['Geral_ST']}"
                         base_federal = 'Tabela 4.3.10 SPED (Cód. 104 - Bebidas / Lei nº 13.097/15)'
-try:
-    # Seu código que está na linha 121 ou próximo dela
-    resultado = 10 / 0
-except Exception as e:
-    # O que fazer caso dê erro
-    print(f"Ocorreu um erro: {e}")
+        else:
+            regra_icms = 'NÃO MAPEADO'
+            regra_pis_cofins = 'NÃO MAPEADO'
 
