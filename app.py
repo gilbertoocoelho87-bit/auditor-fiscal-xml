@@ -48,7 +48,7 @@ def auditoria_lote_divergencias(xml_files):
     todos_produtos = []
     for xml_file in xml_files:
         try:
-            xml_file.seek(0) # Correção estrutural para permitir múltiplas leituras em lote
+            xml_file.seek(0)
             xml_data = xml_file.read()
             root = ET.fromstring(xml_data)
             
@@ -88,7 +88,7 @@ def auditoria_lote_divergencias(xml_files):
                     grupo_4d = ncm[:4] if ncm else ''
                     grupo_2d = ncm[:2] if ncm else ''
                     
-                    # --- CRITÉRIOS DE LEGISLAÇÃO VS XML (TODOS OS NCMS DO CONVÊNIO CONFAZ 142/18) ---
+                    # --- CRITÉRIOS DE LEGISLAÇÃO VS XML ---
                     
                     # Segmento 01: Medicamentos e Fármacos
                     if grupo_4d in ['3002', '3003', '3004', '3005', '3006'] or ncm.startswith('40141000'):
@@ -129,4 +129,6 @@ def auditoria_lote_divergencias(xml_files):
                     elif grupo_2d == '24':
                         regra_icms = 'ST'
                         regra_pis_cofins = 'MONOFÁSICO'
-
+                        base_icms = f"Regime ST Cigarros e Fumo -> {config_uf['Geral_ST']}"
+                        base_federal = 'Tabela 4.3.10 SPED (Cód. 105 - Fumo / Lei nº 11.196/05)'
+                        
