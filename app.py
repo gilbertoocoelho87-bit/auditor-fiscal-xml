@@ -1150,4 +1150,3 @@ st.caption(
     "de XML. A indicação de divergência depende da qualidade "
     "e atualização da base tributária utilizada."
 )
-```
