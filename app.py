@@ -15,6 +15,9 @@ st.set_page_config(page_title="Auditor Fiscal com Exportação PDF", layout="wid
 st.title("📊 Auditor PGDAS - Identificador de Notas Incorretas")
 st.write("Análise em lote de XMLs com relatórios visuais e exportação oficial em PDF.")
 
+# --- COMPONENTE DE CARREGAMENTO ---
+uploaded_files = st.file_uploader("📂 Arraste e solte seus XMLs de Notas Fiscais aqui", type=["xml"], accept_multiple_files=True)
+
 # --- BASE DE LEGISLAÇÃO DE ICMS-ST (TODOS OS ESTADOS) ---
 MATRIZ_ESTADUAL_ICMS = {
     "11": {"UF": "RO", "Construcao_ST": "Anexo VI do RICMS/RO", "Medicamento_ST": "Anexo VI (Medicamentos) do RICMS/RO"},
@@ -49,7 +52,6 @@ MATRIZ_ESTADUAL_ICMS = {
 # --- FUNÇÃO PARA GERAR O ARQUIVO PDF ---
 def gerar_pdf_relatorio(dataframe):
     buffer = io.BytesIO()
-    # Criar documento em modo paisagem (landscape) para caber todas as colunas fiscais
     doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20, title="Relatorio_PGDAS")
     story = []
     
@@ -58,18 +60,14 @@ def gerar_pdf_relatorio(dataframe):
     style_texto = ParagraphStyle('TextoStyle', parent=styles['Normal'], fontName='Helvetica', fontSize=8, leading=10)
     style_header = ParagraphStyle('HeaderStyle', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=colors.white)
 
-    # Título do Relatório
     story.append(Paragraph("RELATÓRIO CONSOLIDADO DE AUDITORIA DE LANÇAMENTOS - PGDAS-D", style_titulo))
     story.append(Spacer(1, 15))
     
-    # Selecionar apenas as colunas mais cruciais para o PDF caber na página de forma organizada
-    colunas_pdf = ["Nota No.", "UF", "Produto", "NCM", "ICMS PGDAS (Correto)", "PIS/COFINS PGDAS (Correto)", "Status XML"]
-    df_filtrado = dataframe[colunas_pdf]
+    colunas_pdf = ["Nota No.", "UF", "Produto", "NCM", "ICMS PGDAS", "PIS/COFINS PGDAS", "Status XML"]
     
-    # Montar os dados da tabela estruturada do PDF
     dados_tabela = [[Paragraph(col, style_header) for col in colunas_pdf]]
     
-    for idx, row in df_filtrado.iterrows():
+    for idx, row in dataframe.iterrows():
         linha = [
             Paragraph(str(row["Nota No."]), style_texto),
             Paragraph(str(row["UF"]), style_texto),
@@ -81,19 +79,18 @@ def gerar_pdf_relatorio(dataframe):
         ]
         dados_tabela.append(linha)
     
-    # Definindo larguras das colunas proporcionais para evitar estouros na impressão
-    tabela_pdf = Table(dados_tabela, colWidths=[40, 25, 260, 55, 100, 110, 60])
+    # 7 colunas - Larguras proporcionais totalizando 750 (largura disponível em paisagem)
+    tabela_pdf = Table(dados_tabela, colWidths=[60, 30, 310, 70, 90, 110, 80])
     
-    # Estilização visual da tabela do PDF (Simulando o visual limpo do site)
     tabela_pdf.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1C3D5A')), # Azul escuro para o cabeçalho
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1C3D5A')),
         ('ALIGN', (0,0), (-1,-1), 'LEFT'),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ('BOTTOMPADDING', (0,0), (-1,0), 8),
         ('TOPPADDING', (0,0), (-1,-1), 6),
         ('BOTTOMPADDING', (0,0), (-1,-1), 6),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')), # Linhas cinzas suaves
-        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F7FAFC')]) # Linhas alternadas
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F7FAFC')])
     ]))
     
     story.append(tabela_pdf)
@@ -164,3 +161,9 @@ def auditoria_lote_divergencias(xml_files):
                         
                     elif grupo_4d in ["3917", "8481", "8536", "7307", "6910", "7412", "7308", "3214", "2523"]:
                         regra_icms = "ST"
+                        regra_pis_cofins = "NORMAL"
+                        base_icms = config_uf["Construcao_ST"]
+                        base_federal = "Regime Geral (PIS/COFINS Não Monofásico)"
+                        
+                    else:
+                        regra_icms = "NORMAL"
