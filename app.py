@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import xml.etree.ElementTree as ET
 import pandas as pd
