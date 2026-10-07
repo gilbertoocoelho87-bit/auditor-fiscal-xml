@@ -79,7 +79,7 @@ def gerar_pdf_relatorio(dataframe):
         ]
         dados_tabela.append(linha)
     
-    # 7 colunas - Larguras proporcionais totalizando 750 (largura disponível em paisagem)
+    # 7 colunas - Definido largura fixa de cada uma para evitar erros (Soma total = 750)
     tabela_pdf = Table(dados_tabela, colWidths=[60, 30, 310, 70, 90, 110, 80])
     
     tabela_pdf.setStyle(TableStyle([
@@ -167,3 +167,4 @@ def auditoria_lote_divergencias(xml_files):
                         
                     else:
                         regra_icms = "NORMAL"
+
