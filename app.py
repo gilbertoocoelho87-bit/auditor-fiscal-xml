@@ -95,78 +95,76 @@ def gerar_pdf_relatorio(dataframe):
     buffer.seek(0)
     return buffer.getvalue()
 
-# --- FUNÇÃO DE AUDITORIA CRÍTICA DE XML ---
+# --- FUNÇÃO DE AUDITORIA CRÍTICA DE XML (BUSCA ROBUSTA) ---
 def auditoria_lote_divergencias(xml_files):
     todos_produtos = []
     
     for xml_file in xml_files:
-        xml_data = xml_file.read()
-        root = ET.fromstring(xml_data)
-        
-        cod_uf = "35"
-        for elem in root.iter():
-            if elem.tag.endswith('cUF'):
-                cod_uf = elem.text
-                break
-                
-        config_uf = MATRIZ_ESTADUAL_ICMS.get(cod_uf, {"UF": "BR", "Construcao_ST": "Regulamento Local", "Medicamento_ST": "Regulamento Local"})
-        uf_nome = config_uf["UF"]
-        
-        numero_nfe = "Não Encontrado"
-        for elem in root.iter():
-            if elem.tag.endswith('nNF'):
-                numero_nfe = elem.text
-                break
-        
-        for det in root.iter():
-            if det.tag.endswith('det'):
-                xProd = "Desconhecido"
-                ncm = ""
-                cst_xml = "00"
-                
-                for elem in det.iter():
-                    if elem.tag.endswith('xProd'):
-                        xProd = elem.text
-                    if elem.tag.endswith('NCM'):
-                        ncm = elem.text
-                
-                for elem in det.iter():
-                    if elem.tag.endswith('CST') or elem.tag.endswith('CSOSN'):
-                        cst_xml = elem.text
-                        break
-                
-                grupo_4d = ncm[:4] if ncm else ""
-                
-                if grupo_4d in ["3002", "3003", "3004", "3005", "3006"] or ncm.startswith("40141000"):
-                    regra_icms = "ST"
-                    regra_pis_cofins = "MONOFÁSICO"
-                    base_icms = config_uf["Medicamento_ST"]
-                    base_federal = "Tabela 4.3.10 SPED (Cód. 102 / Lei 10.147)"
+        try:
+            xml_file.seek(0)
+            xml_data = xml_file.read()
+            root = ET.fromstring(xml_data)
+            
+            # Capturar UF da Nota
+            cod_uf = "35"
+            for elem in root.iter():
+                if "cUF" in elem.tag:
+                    cod_uf = elem.text
+                    break
                     
-                elif grupo_4d in ["8708", "4011", "8407", "8408", "8409"]:
-                    regra_icms = "NORMAL"
-                    regra_pis_cofins = "MONOFÁSICO"
-                    base_icms = "Regime Regular / Alíquota Interna"
-                    base_federal = "Tabela 4.3.10 SPED (Cód. 103 / Lei 10.485)"
+            config_uf = MATRIZ_ESTADUAL_ICMS.get(cod_uf, {"UF": "BR", "Construcao_ST": "Regulamento Local", "Medicamento_ST": "Regulamento Local"})
+            uf_nome = config_uf["UF"]
+            
+            # Capturar número da Nota
+            numero_nfe = "Não Encontrado"
+            for elem in root.iter():
+                if "nNF" in elem.tag:
+                    numero_nfe = elem.text
+                    break
+            
+            # Varrer os itens da nota fiscal de forma garantida
+            for det in root.iter():
+                if "det" in det.tag:
+                    xProd = "Desconhecido"
+                    ncm = ""
+                    cst_xml = "00"
                     
-                elif grupo_4d in ["2203", "2202"]:
-                    regra_icms = "NORMAL"
-                    regra_pis_cofins = "MONOFÁSICO"
-                    base_icms = "Regime Regular / Alíquota Interna"
-                    base_federal = "Tabela 4.3.10 SPED (Cód. 104 / Lei 13.097)"
+                    for elem in det.iter():
+                        if "xProd" in elem.tag:
+                            xProd = elem.text
+                        if "NCM" in elem.tag:
+                            ncm = elem.text
+                            
+                    for elem in det.iter():
+                        if "CST" in elem.tag or "CSOSN" in elem.tag:
+                            cst_xml = elem.text
+                            break
                     
-                elif grupo_4d in ["3917", "8481", "8536", "7307", "6910", "7412", "7308", "3214", "2523"]:
-                    regra_icms = "ST"
-                    regra_pis_cofins = "NORMAL"
-                    base_icms = config_uf["Construcao_ST"]
-                    base_federal = "Regime Geral (PIS/COFINS Não Monofásico)"
+                    grupo_4d = ncm[:4] if ncm else ""
                     
-                else:
-                    regra_icms = "NORMAL"
-                    regra_pis_cofins = "NORMAL"
-                    base_icms = "Regime Comum / Alíquota Interna"
-                    base_federal = "Regime Geral (PIS/COFINS Não Monofásico)"
-                
-                erros_detectados = []
-                if regra_icms == "ST" and cst_xml in ["00", "20", "40", "102", "400", "90"]:
-                    erros_detectados.append(f"ICMS Errado (CST {cst_xml} mas deveria ser ST)")
+                    # Definição das Regras
+                    if grupo_4d in ["3002", "3003", "3004", "3005", "3006"] or ncm.startswith("40141000"):
+                        regra_icms = "ST"
+                        regra_pis_cofins = "MONOFÁSICO"
+                        base_icms = config_uf["Medicamento_ST"]
+                        base_federal = "Tabela 4.3.10 SPED (Cód. 102 / Lei 10.147)"
+                        
+                    elif grupo_4d in ["8708", "4011", "8407", "8408", "8409"]:
+                        regra_icms = "NORMAL"
+                        regra_pis_cofins = "MONOFÁSICO"
+                        base_icms = "Regime Regular / Alíquota Interna"
+                        base_federal = "Tabela 4.3.10 SPED (Cód. 103 / Lei 10.485)"
+                        
+                    elif grupo_4d in ["2203", "2202"]:
+                        regra_icms = "NORMAL"
+                        regra_pis_cofins = "MONOFÁSICO"
+                        base_icms = "Regime Regular / Alíquota Interna"
+                        base_federal = "Tabela 4.3.10 SPED (Cód. 104 / Lei 13.097)"
+                        
+                    elif grupo_4d in ["3917", "8481", "8536", "7307", "6910", "7412", "7308", "3214", "2523"]:
+                        regra_icms = "ST"
+                        regra_pis_cofins = "NORMAL"
+                        base_icms = config_uf["Construcao_ST"]
+                        base_federal = "Regime Geral (PIS/COFINS Não Monofásico)"
+                        
+                    else:
