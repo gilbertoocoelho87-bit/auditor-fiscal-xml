@@ -64,7 +64,6 @@ def gerar_pdf_relatorio(dataframe):
     story.append(Spacer(1, 15))
     
     colunas_pdf = ["Nota No.", "UF", "Produto", "NCM", "ICMS PGDAS", "PIS/COFINS PGDAS", "Status XML"]
-    
     dados_tabela = [[Paragraph(col, style_header) for col in colunas_pdf]]
     
     for idx, row in dataframe.iterrows():
@@ -79,9 +78,7 @@ def gerar_pdf_relatorio(dataframe):
         ]
         dados_tabela.append(linha)
     
-    # Criando a tabela sem larguras estáticas - O ReportLab calcula automaticamente
     tabela_pdf = Table(dados_tabela)
-    
     tabela_pdf.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1C3D5A')),
         ('ALIGN', (0,0), (-1,-1), 'LEFT'),
@@ -150,13 +147,13 @@ def auditoria_lote_divergencias(xml_files):
                     elif grupo_4d in ["8708", "4011", "8407", "8408", "8409"]:
                         regra_icms = "NORMAL"
                         regra_pis_cofins = "MONOFÁSICO"
-                        base_icms = f"Regime Regular / Alíquota Interna"
+                        base_icms = "Regime Regular / Alíquota Interna"
                         base_federal = "Tabela 4.3.10 SPED (Cód. 103 / Lei 10.485)"
                         
                     elif grupo_4d in ["2203", "2202"]:
                         regra_icms = "NORMAL"
                         regra_pis_cofins = "MONOFÁSICO"
-                        base_icms = f"Regime Regular / Alíquota Interna"
+                        base_icms = "Regime Regular / Alíquota Interna"
                         base_federal = "Tabela 4.3.10 SPED (Cód. 104 / Lei 13.097)"
                         
                     elif grupo_4d in ["3917", "8481", "8536", "7307", "6910", "7412", "7308", "3214", "2523"]:
@@ -168,3 +165,4 @@ def auditoria_lote_divergencias(xml_files):
                     else:
                         regra_icms = "NORMAL"
                         regra_pis_cofins = "NORMAL"
+                        base_icms = "Regime Comum / Alíquota Interna"
