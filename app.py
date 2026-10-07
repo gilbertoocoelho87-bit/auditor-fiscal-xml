@@ -72,8 +72,8 @@ def gerar_pdf_relatorio(dataframe):
             Paragraph(str(row["UF"]), style_texto),
             Paragraph(str(row["Produto"]), style_texto),
             Paragraph(str(row["NCM"]), style_texto),
-            Paragraph(str(row["ICMS PGDAS (Correto)"]), style_texto),
-            Paragraph(str(row["PIS/COFINS PGDAS (Correto)"]), style_texto),
+            Paragraph(str(row["ICMS PGDAS"]), style_texto),
+            Paragraph(str(row["PIS/COFINS PGDAS"]), style_texto),
             Paragraph(str(row["Status XML"]), style_texto)
         ]
         dados_tabela.append(linha)
@@ -169,3 +169,4 @@ def auditoria_lote_divergencias(xml_files):
                 
                 erros_detectados = []
                 if regra_icms == "ST" and cst_xml in ["00", "20", "40", "102", "400", "90"]:
+                    erros_detectados.append(f"ICMS Errado (CST {cst_xml} mas deveria ser ST)")
