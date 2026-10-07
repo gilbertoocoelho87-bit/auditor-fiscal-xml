@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 
 # ============================================================
-# CONFIGURAÇÃO
+# AUDITOR FISCAL XML - V2
 # ============================================================
 
 st.set_page_config(
@@ -16,11 +16,10 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📊 Auditor PGDAS - Identificador de Notas Incorretas")
-
-st.write(
-    "Sistema de auditoria de XMLs para identificação de possíveis "
-    "divergências tributárias por NCM, CEST, CFOP, CST/CSOSN e UF."
+st.title("📊 Auditor Fiscal de Divergências - V2")
+st.caption(
+    "Leitura de NF-e XML + auditoria automática de inconsistências "
+    "e comparação com base tributária."
 )
 
 # ============================================================
@@ -28,1125 +27,875 @@ st.write(
 # ============================================================
 
 UF_CODIGOS = {
-    "11": "RO",
-    "12": "AC",
-    "13": "AM",
-    "14": "RR",
-    "15": "PA",
-    "16": "AP",
-    "17": "TO",
-    "21": "MA",
-    "22": "PI",
-    "23": "CE",
-    "24": "RN",
-    "25": "PB",
-    "26": "PE",
-    "27": "AL",
-    "28": "SE",
-    "29": "BA",
-    "31": "MG",
-    "32": "ES",
-    "33": "RJ",
-    "35": "SP",
-    "41": "PR",
-    "42": "SC",
-    "43": "RS",
-    "50": "MS",
-    "51": "MT",
-    "52": "GO",
-    "53": "DF",
+    "11": "RO", "12": "AC", "13": "AM", "14": "RR", "15": "PA",
+    "16": "AP", "17": "TO", "21": "MA", "22": "PI", "23": "CE",
+    "24": "RN", "25": "PB", "26": "PE", "27": "AL", "28": "SE",
+    "29": "BA", "31": "MG", "32": "ES", "33": "RJ", "35": "SP",
+    "41": "PR", "42": "SC", "43": "RS", "50": "MS", "51": "MT",
+    "52": "GO", "53": "DF"
 }
 
-# ============================================================
-# BASE TRIBUTÁRIA INICIAL
-# ============================================================
+UFS = sorted(UF_CODIGOS.values())
 
 COLUNAS_BASE = [
-    "UF_ORIGEM",
-    "UF_DESTINO",
-    "NCM",
-    "CEST",
-    "CFOP",
-    "REGIME",
-    "ICMS",
-    "ICMS_ST",
-    "DIFAL",
-    "FCP",
-    "PIS_COFINS",
-    "IPI",
-    "IBS_CBS",
-    "ALIQUOTA_ICMS",
-    "MVA",
-    "REDUCAO_BASE",
-    "CODIGO_BENEFICIO",
-    "LEGISLACAO",
-    "FUNDAMENTO_LEGAL",
+    "UF_ORIGEM", "UF_DESTINO", "NCM", "CEST", "CFOP", "REGIME",
+    "ICMS", "ICMS_ST", "DIFAL", "FCP", "PIS_COFINS", "IPI",
+    "IBS_CBS", "ALIQUOTA_ICMS", "MVA", "REDUCAO_BASE",
+    "CODIGO_BENEFICIO", "LEGISLACAO", "FUNDAMENTO_LEGAL",
     "OBSERVACAO"
 ]
 
 ARQUIVO_BASE = "base_tributaria.csv"
 
+# ============================================================
+# FUNÇÕES BÁSICAS
+# ============================================================
 
-def criar_base_inicial():
-    """
-    Cria uma base vazia estruturada.
-    A base deve ser alimentada com regras tributárias oficiais.
-    """
+def normalizar(valor):
+    return str(valor or "").strip()
 
+def somente_digitos(valor):
+    return re.sub(r"\D", "", normalizar(valor))
+
+def normalizar_ncm(valor):
+    v = somente_digitos(valor)
+    return v.zfill(8) if v else ""
+
+def normalizar_cest(valor):
+    return somente_digitos(valor)
+
+def normalizar_cfop(valor):
+    return somente_digitos(valor)
+
+def tag_final(elemento):
+    return elemento.tag.split("}")[-1]
+
+def texto(elemento):
+    return normalizar(elemento.text if elemento is not None else "")
+
+def encontrar(parent, nome):
+    for el in parent.iter():
+        if tag_final(el) == nome:
+            return el
+    return None
+
+def encontrar_texto(parent, nome):
+    return texto(encontrar(parent, nome))
+
+# ============================================================
+# BASE TRIBUTÁRIA
+# ============================================================
+
+def criar_base():
     if not os.path.exists(ARQUIVO_BASE):
-
-        df = pd.DataFrame(columns=COLUNAS_BASE)
-
-        df.to_csv(
+        pd.DataFrame(columns=COLUNAS_BASE).to_csv(
             ARQUIVO_BASE,
             index=False,
-            encoding="utf-8-sig",
-            sep=";"
+            sep=";",
+            encoding="utf-8-sig"
         )
 
-
 def carregar_base():
-    criar_base_inicial()
-
+    criar_base()
     try:
         df = pd.read_csv(
             ARQUIVO_BASE,
             sep=";",
             dtype=str,
             encoding="utf-8-sig"
-        )
-
-        df = df.fillna("")
-
-        return df
-
+        ).fillna("")
     except Exception:
         return pd.DataFrame(columns=COLUNAS_BASE)
 
+    for col in COLUNAS_BASE:
+        if col not in df.columns:
+            df[col] = ""
 
-BASE_TRIBUTARIA = carregar_base()
+    return df[COLUNAS_BASE]
 
-# ============================================================
-# NORMALIZAÇÃO
-# ============================================================
-
-
-def limpar_numero(valor):
-
-    if valor is None:
-        return ""
-
-    return str(valor).strip()
-
-
-def normalizar_ncm(valor):
-
-    valor = limpar_numero(valor)
-
-    valor = re.sub(r"\D", "", valor)
-
-    return valor.zfill(8) if valor else ""
-
-
-def normalizar_cest(valor):
-
-    valor = limpar_numero(valor)
-
-    valor = re.sub(r"\D", "", valor)
-
-    return valor
-
-
-def normalizar_cfop(valor):
-
-    valor = limpar_numero(valor)
-
-    valor = re.sub(r"\D", "", valor)
-
-    return valor
-
-
-def texto_xml(elemento):
-
-    if elemento is None:
-        return ""
-
-    return elemento.text.strip() if elemento.text else ""
-
-
-def tag_final(elemento):
-
-    return elemento.tag.split("}")[-1]
-
-
-def encontrar_elemento(parent, nome):
-
-    for elemento in parent.iter():
-
-        if tag_final(elemento) == nome:
-
-            return elemento
-
-    return None
-
-
-def encontrar_texto(parent, nome):
-
-    elemento = encontrar_elemento(parent, nome)
-
-    return texto_xml(elemento)
-
+BASE = carregar_base()
 
 # ============================================================
-# LEITURA DO XML
+# LEITURA DA NF-E
 # ============================================================
 
-
-def identificar_uf(root):
-
+def identificar_uf_origem(root):
     cuf = encontrar_texto(root, "cUF")
-
     return UF_CODIGOS.get(cuf, "")
 
-
-def identificar_numero_nfe(root):
-
-    return encontrar_texto(root, "nNF")
-
-
-def identificar_serie(root):
-
-    return encontrar_texto(root, "serie")
-
-
-def identificar_data(root):
-
-    valor = encontrar_texto(root, "dhEmi")
-
-    if not valor:
-
-        valor = encontrar_texto(root, "dEmi")
-
-    return valor
-
-
-def identificar_destino(root):
-
-    # Primeiramente tenta UF do destinatário
+def identificar_uf_destino(root):
     dest = None
-
-    for elemento in root.iter():
-
-        if tag_final(elemento) == "dest":
-
-            dest = elemento
-
+    for el in root.iter():
+        if tag_final(el) == "dest":
+            dest = el
             break
-
     if dest is not None:
-
-        uf = encontrar_texto(dest, "UF")
-
-        if uf:
-
-            return uf
-
+        return encontrar_texto(dest, "UF")
     return ""
 
+def extrair_dados_nfe(root):
+    return {
+        "NF-e": encontrar_texto(root, "nNF"),
+        "Série": encontrar_texto(root, "serie"),
+        "Data Emissão": encontrar_texto(root, "dhEmi") or encontrar_texto(root, "dEmi"),
+        "Natureza": encontrar_texto(root, "natOp"),
+        "UF Origem": identificar_uf_origem(root),
+        "UF Destino": identificar_uf_destino(root),
+        "CNPJ Emitente": somente_digitos(encontrar_texto(root, "CNPJ")),
+    }
 
 # ============================================================
-# LEITURA DOS PRODUTOS
+# EXTRAÇÃO DOS ITENS
 # ============================================================
 
-
-def extrair_produtos(root):
-
-    produtos = []
+def extrair_itens(root):
+    itens = []
 
     for det in root.iter():
-
         if tag_final(det) != "det":
-
             continue
 
         prod = None
+        imposto = None
 
-        for elemento in det:
-
-            if tag_final(elemento) == "prod":
-
-                prod = elemento
-                break
+        for filho in det:
+            nome = tag_final(filho)
+            if nome == "prod":
+                prod = filho
+            elif nome == "imposto":
+                imposto = filho
 
         if prod is None:
-
             continue
 
-        xprod = encontrar_texto(prod, "xProd")
         ncm = normalizar_ncm(encontrar_texto(prod, "NCM"))
         cest = normalizar_cest(encontrar_texto(prod, "CEST"))
         cfop = normalizar_cfop(encontrar_texto(prod, "CFOP"))
 
-        quantidade = encontrar_texto(prod, "qCom")
-        valor_unitario = encontrar_texto(prod, "vUnCom")
-        valor_total = encontrar_texto(prod, "vProd")
-
-        cst = ""
-        csosn = ""
-
-        for imposto in det.iter():
-
-            nome = tag_final(imposto)
-
-            if nome == "CST":
-
-                cst = texto_xml(imposto)
-
-            if nome == "CSOSN":
-
-                csosn = texto_xml(imposto)
-
-        # ICMS
-        icms_cst = cst
-        icms_csosn = csosn
-
-        # PIS
-        pis_cst = ""
-
-        for elemento in det.iter():
-
-            if tag_final(elemento) == "PIS":
-
-                for filho in elemento.iter():
-
-                    nome = tag_final(filho)
-
-                    if nome in ["CST"]:
-
-                        pis_cst = texto_xml(filho)
-                        break
-
-        # COFINS
-        cofins_cst = ""
-
-        for elemento in det.iter():
-
-            if tag_final(elemento) == "COFINS":
-
-                for filho in elemento.iter():
-
-                    nome = tag_final(filho)
-
-                    if nome == "CST":
-
-                        cofins_cst = texto_xml(filho)
-                        break
-
-        # IPI
-        ipi_cst = ""
-
-        for elemento in det.iter():
-
-            if tag_final(elemento) == "IPI":
-
-                for filho in elemento.iter():
-
-                    if tag_final(filho) == "CST":
-
-                        ipi_cst = texto_xml(filho)
-                        break
-
-        produtos.append({
-            "Produto": xprod,
+        item = {
+            "Item": det.attrib.get("nItem", ""),
+            "Produto": encontrar_texto(prod, "xProd"),
             "NCM": ncm,
             "CEST": cest,
             "CFOP": cfop,
-            "Quantidade": quantidade,
-            "Valor Unitário": valor_unitario,
-            "Valor Produto": valor_total,
-            "CST ICMS": icms_cst,
-            "CSOSN ICMS": icms_csosn,
-            "CST PIS": pis_cst,
-            "CST COFINS": cofins_cst,
-            "CST IPI": ipi_cst
-        })
+            "cProd": encontrar_texto(prod, "cProd"),
+            "Quantidade": encontrar_texto(prod, "qCom"),
+            "Valor Unitário": encontrar_texto(prod, "vUnCom"),
+            "Valor Produto": encontrar_texto(prod, "vProd"),
+            "CST ICMS": "",
+            "CSOSN ICMS": "",
+            "Origem ICMS": "",
+            "Modalidade BC ICMS": "",
+            "Alíquota ICMS": "",
+            "Valor ICMS": "",
+            "CST PIS": "",
+            "CST COFINS": "",
+            "CST IPI": "",
+        }
 
-    return produtos
+        # ICMS
+        if imposto is not None:
+            for el in imposto.iter():
+                nome = tag_final(el)
+                if nome == "orig":
+                    item["Origem ICMS"] = texto(el)
+                elif nome == "CST" and not item["CST ICMS"]:
+                    item["CST ICMS"] = texto(el)
+                elif nome == "CSOSN":
+                    item["CSOSN ICMS"] = texto(el)
+                elif nome == "modBC":
+                    item["Modalidade BC ICMS"] = texto(el)
+                elif nome == "pICMS":
+                    item["Alíquota ICMS"] = texto(el)
+                elif nome == "vICMS":
+                    item["Valor ICMS"] = texto(el)
 
+        # PIS
+        for el in det.iter():
+            if tag_final(el) == "PIS":
+                for filho in el.iter():
+                    if tag_final(filho) == "CST":
+                        item["CST PIS"] = texto(filho)
+                        break
+
+        # COFINS
+        for el in det.iter():
+            if tag_final(el) == "COFINS":
+                for filho in el.iter():
+                    if tag_final(filho) == "CST":
+                        item["CST COFINS"] = texto(filho)
+                        break
+
+        # IPI
+        for el in det.iter():
+            if tag_final(el) == "IPI":
+                for filho in el.iter():
+                    if tag_final(filho) == "CST":
+                        item["CST IPI"] = texto(filho)
+                        break
+
+        itens.append(item)
+
+    return itens
 
 # ============================================================
-# PESQUISA NA BASE TRIBUTÁRIA
+# REGRAS AUTOMÁTICAS DE CONSISTÊNCIA
 # ============================================================
 
+CST_ICMS_VALIDOS = {
+    "00", "10", "20", "30", "40", "41", "50", "51", "60",
+    "70", "90"
+}
 
-def buscar_regra(
-    uf_origem,
-    uf_destino,
-    ncm,
-    cest,
-    cfop
-):
+CSOSN_VALIDOS = {
+    "101", "102", "103", "201", "202", "203", "300", "400", "500", "900"
+}
 
-    if BASE_TRIBUTARIA.empty:
+CST_PIS_VALIDOS = {f"{i:02d}" for i in range(1, 100)}
+CST_COFINS_VALIDOS = {f"{i:02d}" for i in range(1, 100)}
 
+def adicionar_erro(lista, tipo, descricao, gravidade="ALTA", regra=""):
+    lista.append({
+        "Tipo": tipo,
+        "Gravidade": gravidade,
+        "Descrição": descricao,
+        "Regra/Referência": regra
+    })
+
+def auditoria_estrutural(item, nfe):
+    erros = []
+    avisos = []
+
+    ncm = item["NCM"]
+    cest = item["CEST"]
+    cfop = item["CFOP"]
+    cst = item["CST ICMS"]
+    csosn = item["CSOSN ICMS"]
+    pis = item["CST PIS"]
+    cofins = item["CST COFINS"]
+
+    # NCM
+    if not ncm:
+        adicionar_erro(
+            erros, "NCM",
+            "NCM não informado no item.",
+            "ALTA"
+        )
+    elif len(ncm) != 8:
+        adicionar_erro(
+            erros, "NCM",
+            f"NCM '{ncm}' possui {len(ncm)} dígitos; o NCM deve possuir 8 dígitos.",
+            "ALTA"
+        )
+
+    # CFOP
+    if not cfop:
+        adicionar_erro(
+            erros, "CFOP",
+            "CFOP não informado no item.",
+            "ALTA"
+        )
+    elif len(cfop) != 4:
+        adicionar_erro(
+            erros, "CFOP",
+            f"CFOP '{cfop}' possui tamanho inválido.",
+            "ALTA"
+        )
+
+    # CEST
+    if cest and len(cest) != 7:
+        adicionar_erro(
+            erros, "CEST",
+            f"CEST '{cest}' possui tamanho inválido.",
+            "MÉDIA"
+        )
+
+    # ICMS / CSOSN
+    if cst and cst not in CST_ICMS_VALIDOS:
+        adicionar_erro(
+            erros, "CST ICMS",
+            f"CST ICMS '{cst}' não está no conjunto padrão esperado.",
+            "ALTA"
+        )
+
+    if csosn and csosn not in CSOSN_VALIDOS:
+        adicionar_erro(
+            erros, "CSOSN",
+            f"CSOSN '{csosn}' não está no conjunto padrão esperado.",
+            "ALTA"
+        )
+
+    # Regra básica CST x CSOSN
+    if cst and csosn:
+        adicionar_erro(
+            erros, "ICMS",
+            f"O item apresenta CST '{cst}' e CSOSN '{csosn}' simultaneamente. "
+            "Verifique a estrutura do XML e o regime tributário.",
+            "ALTA"
+        )
+
+    # Simples Nacional normalmente utiliza CSOSN
+    if nfe["CNPJ Emitente"] and csosn:
+        pass
+
+    # PIS / COFINS
+    if pis and pis not in CST_PIS_VALIDOS:
+        adicionar_erro(
+            erros, "PIS",
+            f"CST PIS '{pis}' inválido.",
+            "ALTA"
+        )
+
+    if cofins and cofins not in CST_COFINS_VALIDOS:
+        adicionar_erro(
+            erros, "COFINS",
+            f"CST COFINS '{cofins}' inválido.",
+            "ALTA"
+        )
+
+    # Operação interestadual
+    uf_o = nfe["UF Origem"]
+    uf_d = nfe["UF Destino"]
+
+    if uf_o and uf_d and uf_o != uf_d:
+        if cfop.startswith(("5", "6")):
+            pass
+        else:
+            adicionar_erro(
+                erros, "CFOP",
+                f"Operação entre {uf_o} e {uf_d} com CFOP '{cfop}'. "
+                "Verifique se o CFOP corresponde à operação interestadual.",
+                "MÉDIA"
+            )
+
+    # Alíquota negativa/impossível
+    if item["Alíquota ICMS"]:
+        try:
+            aliq = float(item["Alíquota ICMS"].replace(",", "."))
+            if aliq < 0 or aliq > 100:
+                adicionar_erro(
+                    erros, "ICMS",
+                    f"Alíquota ICMS '{item['Alíquota ICMS']}' fora do intervalo esperado.",
+                    "ALTA"
+                )
+        except ValueError:
+            adicionar_erro(
+                erros, "ICMS",
+                f"Alíquota ICMS '{item['Alíquota ICMS']}' não é numérica.",
+                "ALTA"
+            )
+
+    return erros, avisos
+
+# ============================================================
+# BUSCA NA BASE TRIBUTÁRIA
+# ============================================================
+
+def buscar_regra(uf_origem, uf_destino, ncm, cest, cfop):
+    if BASE.empty:
         return None
 
-    base = BASE_TRIBUTARIA.copy()
+    base = BASE.copy().fillna("")
 
-    base = base.fillna("")
-
-    # Normalização
-    for coluna in [
-        "UF_ORIGEM",
-        "UF_DESTINO",
-        "NCM",
-        "CEST",
-        "CFOP"
-    ]:
-
-        if coluna not in base.columns:
-
-            base[coluna] = ""
+    for col in ["UF_ORIGEM", "UF_DESTINO"]:
+        base[col] = base[col].astype(str).str.upper().str.strip()
 
     base["NCM"] = base["NCM"].apply(normalizar_ncm)
     base["CEST"] = base["CEST"].apply(normalizar_cest)
     base["CFOP"] = base["CFOP"].apply(normalizar_cfop)
 
-    # ========================================================
-    # PRIORIDADE 1
-    # UF + NCM + CEST + CFOP
-    # ========================================================
-
-    filtro = base[
-        (base["UF_DESTINO"].isin(["", uf_destino]))
-        &
-        (base["UF_ORIGEM"].isin(["", uf_origem]))
-        &
-        (base["NCM"].isin(["", ncm]))
-        &
-        (base["CEST"].isin(["", cest]))
-        &
-        (base["CFOP"].isin(["", cfop]))
+    # Mais específico primeiro
+    filtros = [
+        (
+            (base["UF_ORIGEM"].isin(["", uf_origem])) &
+            (base["UF_DESTINO"].isin(["", uf_destino])) &
+            (base["NCM"] == ncm) &
+            (base["CEST"].isin(["", cest])) &
+            (base["CFOP"].isin(["", cfop]))
+        ),
+        (
+            (base["UF_DESTINO"].isin(["", uf_destino])) &
+            (base["NCM"] == ncm)
+        ),
+        (
+            base["NCM"] == ncm
+        )
     ]
 
-    if not filtro.empty:
-
-        return filtro.iloc[0].to_dict()
-
-    # ========================================================
-    # PRIORIDADE 2
-    # UF + NCM
-    # ========================================================
-
-    filtro = base[
-        (base["UF_DESTINO"].isin(["", uf_destino]))
-        &
-        (base["NCM"] == ncm)
-    ]
-
-    if not filtro.empty:
-
-        return filtro.iloc[0].to_dict()
-
-    # ========================================================
-    # PRIORIDADE 3
-    # NCM
-    # ========================================================
-
-    filtro = base[
-        base["NCM"] == ncm
-    ]
-
-    if not filtro.empty:
-
-        return filtro.iloc[0].to_dict()
+    for filtro in filtros:
+        achou = base[filtro]
+        if not achou.empty:
+            return achou.iloc[0].to_dict()
 
     return None
 
-
 # ============================================================
-# AUDITORIA
+# COMPARAÇÃO COM BASE TRIBUTÁRIA
 # ============================================================
 
+def comparar_com_regra(item, regra):
+    erros = []
 
-def auditar_xml(xml_file):
+    if not regra:
+        return erros
 
-    resultados = []
+    icms_st = normalizar(regra.get("ICMS_ST", "")).upper()
+    pis_cofins = normalizar(regra.get("PIS_COFINS", "")).upper()
 
-    try:
+    cst = item["CST ICMS"]
+    csosn = item["CSOSN ICMS"]
+    pis = item["CST PIS"]
+    cofins = item["CST COFINS"]
 
-        xml_data = xml_file.read()
-
-        root = ET.fromstring(xml_data)
-
-        uf_origem = identificar_uf(root)
-        uf_destino = identificar_destino(root)
-
-        numero_nfe = identificar_numero_nfe(root)
-        serie = identificar_serie(root)
-        data_emissao = identificar_data(root)
-
-        produtos = extrair_produtos(root)
-
-        if not produtos:
-
-            return []
-
-        for produto in produtos:
-
-            ncm = produto["NCM"]
-            cest = produto["CEST"]
-            cfop = produto["CFOP"]
-
-            regra = buscar_regra(
-                uf_origem,
-                uf_destino,
-                ncm,
-                cest,
-                cfop
+    # ICMS-ST
+    if icms_st in {"SIM", "ST", "YES"}:
+        if cst in {"00", "20", "40", "41", "90"} and not csosn:
+            adicionar_erro(
+                erros,
+                "ICMS-ST",
+                f"A base tributária indica ICMS-ST, porém o XML apresenta CST ICMS '{cst}'. "
+                "Verifique a aplicação da substituição tributária.",
+                "ALTA",
+                regra.get("FUNDAMENTO_LEGAL", "")
             )
 
-            divergencias = []
+    # Monofásico
+    if pis_cofins in {"MONOFÁSICO", "MONOFASICO", "MONOFÁSICA", "MONOFASICA"}:
+        if pis not in {"04", "06", ""}:
+            adicionar_erro(
+                erros,
+                "PIS",
+                f"A base indica PIS/COFINS monofásico, mas o XML apresenta CST PIS '{pis}'.",
+                "ALTA",
+                regra.get("FUNDAMENTO_LEGAL", "")
+            )
 
-            status = "SEM REGRA"
+        if cofins not in {"04", "06", ""}:
+            adicionar_erro(
+                erros,
+                "COFINS",
+                f"A base indica PIS/COFINS monofásico, mas o XML apresenta CST COFINS '{cofins}'.",
+                "ALTA",
+                regra.get("FUNDAMENTO_LEGAL", "")
+            )
 
-            if regra:
+    return erros
 
-                status = "ANALISADO"
+# ============================================================
+# PROCESSAMENTO
+# ============================================================
 
-                icms_regra = regra.get("ICMS", "")
-                icms_st_regra = regra.get("ICMS_ST", "")
-                difal_regra = regra.get("DIFAL", "")
-                pis_cofins_regra = regra.get("PIS_COFINS", "")
-                ipi_regra = regra.get("IPI", "")
-                ibs_cbs_regra = regra.get("IBS_CBS", "")
+def processar_xml(arquivo):
+    resultados = []
+    detalhes_erros = []
 
-                # =================================================
-                # ICMS-ST
-                # =================================================
+    try:
+        conteudo = arquivo.read()
+        root = ET.fromstring(conteudo)
+        nfe = extrair_dados_nfe(root)
+        itens = extrair_itens(root)
 
-                if icms_st_regra.upper() == "SIM":
+        for item in itens:
+            erros, avisos = auditoria_estrutural(item, nfe)
+            regra = buscar_regra(
+                nfe["UF Origem"],
+                nfe["UF Destino"],
+                item["NCM"],
+                item["CEST"],
+                item["CFOP"]
+            )
 
-                    cst = produto["CST ICMS"]
-                    csosn = produto["CSOSN ICMS"]
+            erros_regra = comparar_com_regra(item, regra)
+            erros.extend(erros_regra)
 
-                    cst_normal = [
-                        "00",
-                        "20",
-                        "40",
-                        "41",
-                        "50",
-                        "90"
-                    ]
-
-                    if cst in cst_normal:
-
-                        divergencias.append(
-                            f"Possível ICMS-ST não informado. "
-                            f"CST encontrado: {cst}."
-                        )
-
-                # =================================================
-                # PIS/COFINS MONOFÁSICO
-                # =================================================
-
-                if pis_cofins_regra.upper() == "MONOFÁSICO":
-
-                    pis_cst = produto["CST PIS"]
-                    cofins_cst = produto["CST COFINS"]
-
-                    if pis_cst not in ["04", "06", ""]:
-                        divergencias.append(
-                            f"PIS possivelmente incompatível "
-                            f"com regra monofásica. CST: {pis_cst}"
-                        )
-
-                    if cofins_cst not in ["04", "06", ""]:
-                        divergencias.append(
-                            f"COFINS possivelmente incompatível "
-                            f"com regra monofásica. CST: {cofins_cst}"
-                        )
-
-                # =================================================
-                # DIFAL
-                # =================================================
-
-                if difal_regra.upper() == "SIM":
-
-                    if uf_origem != uf_destino:
-
-                        divergencias.append(
-                            "Operação interestadual com possível incidência "
-                            "de DIFAL conforme regra cadastrada."
-                        )
-
-                # =================================================
-                # IBS/CBS
-                # =================================================
-
-                if ibs_cbs_regra:
-
-                    ibs_cbs_info = ibs_cbs_regra
-
-                else:
-
-                    ibs_cbs_info = "Não informado"
-
-            else:
-
-                icms_regra = ""
-                icms_st_regra = ""
-                difal_regra = ""
-                pis_cofins_regra = ""
-                ipi_regra = ""
-                ibs_cbs_info = ""
-
-            if divergencias:
-
-                status = "❌ INCORRETO"
-
+            if erros:
+                status = "❌ ERRO ENCONTRADO"
             elif regra:
+                status = "✅ CONFORME COM A BASE"
+            else:
+                status = "⚠️ SEM REGRA TRIBUTÁRIA"
 
-                status = "✅ ANALISADO"
+            fundamento = regra.get("FUNDAMENTO_LEGAL", "") if regra else ""
+            legislacao = regra.get("LEGISLACAO", "") if regra else ""
 
             resultados.append({
-
-                "Arquivo": xml_file.name,
-                "NF-e": numero_nfe,
-                "Série": serie,
-                "Data Emissão": data_emissao,
-
-                "UF Origem": uf_origem,
-                "UF Destino": uf_destino,
-
-                "Produto": produto["Produto"],
-                "NCM": ncm,
-                "CEST": cest,
-                "CFOP": cfop,
-
-                "Quantidade": produto["Quantidade"],
-                "Valor Produto": produto["Valor Produto"],
-
-                "CST ICMS": produto["CST ICMS"],
-                "CSOSN ICMS": produto["CSOSN ICMS"],
-
-                "CST PIS": produto["CST PIS"],
-                "CST COFINS": produto["CST COFINS"],
-
-                "CST IPI": produto["CST IPI"],
-
-                "Regra ICMS": icms_regra,
-                "ICMS-ST": icms_st_regra,
-                "DIFAL": difal_regra,
-                "PIS/COFINS": pis_cofins_regra,
-                "IPI": ipi_regra,
-                "IBS/CBS": ibs_cbs_info,
-
-                "Alíquota ICMS": regra.get(
-                    "ALIQUOTA_ICMS", ""
-                ) if regra else "",
-
-                "MVA": regra.get(
-                    "MVA", ""
-                ) if regra else "",
-
-                "Redução Base": regra.get(
-                    "REDUCAO_BASE", ""
-                ) if regra else "",
-
-                "Código Benefício": regra.get(
-                    "CODIGO_BENEFICIO", ""
-                ) if regra else "",
-
-                "Legislação": regra.get(
-                    "LEGISLACAO", ""
-                ) if regra else "",
-
-                "Fundamento Legal": regra.get(
-                    "FUNDAMENTO_LEGAL", ""
-                ) if regra else "",
-
-                "Observação Legal": regra.get(
-                    "OBSERVACAO", ""
-                ) if regra else "",
-
+                "Arquivo": arquivo.name,
+                "NF-e": nfe["NF-e"],
+                "Item": item["Item"],
+                "UF Origem": nfe["UF Origem"],
+                "UF Destino": nfe["UF Destino"],
+                "Produto": item["Produto"],
+                "NCM": item["NCM"],
+                "CEST": item["CEST"],
+                "CFOP": item["CFOP"],
+                "CST ICMS": item["CST ICMS"],
+                "CSOSN ICMS": item["CSOSN ICMS"],
+                "CST PIS": item["CST PIS"],
+                "CST COFINS": item["CST COFINS"],
+                "CST IPI": item["CST IPI"],
+                "Alíquota ICMS XML": item["Alíquota ICMS"],
+                "Valor ICMS XML": item["Valor ICMS"],
+                "Regra ICMS": regra.get("ICMS", "") if regra else "",
+                "ICMS-ST Base": regra.get("ICMS_ST", "") if regra else "",
+                "PIS/COFINS Base": regra.get("PIS_COFINS", "") if regra else "",
+                "DIFAL Base": regra.get("DIFAL", "") if regra else "",
+                "IBS/CBS Base": regra.get("IBS_CBS", "") if regra else "",
+                "Legislação": legislacao,
+                "Fundamento Legal": fundamento,
                 "Status": status,
-
-                "Divergência Encontrada":
-                    " | ".join(divergencias)
-                    if divergencias
-                    else "Nenhuma divergência identificada"
-
+                "Quantidade de Erros": len(erros)
             })
 
-    except Exception as erro:
+            for erro in erros:
+                detalhes_erros.append({
+                    "Arquivo": arquivo.name,
+                    "NF-e": nfe["NF-e"],
+                    "Item": item["Item"],
+                    "UF Origem": nfe["UF Origem"],
+                    "UF Destino": nfe["UF Destino"],
+                    "Produto": item["Produto"],
+                    "NCM": item["NCM"],
+                    "CEST": item["CEST"],
+                    "CFOP": item["CFOP"],
+                    "CST ICMS": item["CST ICMS"],
+                    "CSOSN ICMS": item["CSOSN ICMS"],
+                    "CST PIS": item["CST PIS"],
+                    "CST COFINS": item["CST COFINS"],
+                    "Tipo de Erro": erro["Tipo"],
+                    "Gravidade": erro["Gravidade"],
+                    "ERRO ENCONTRADO": erro["Descrição"],
+                    "Regra/Referência": erro["Regra/Referência"],
+                    "Legislação": legislacao,
+                    "Fundamento Legal": fundamento
+                })
 
-        st.error(
-            f"Erro ao processar {xml_file.name}: {erro}"
-        )
+    except Exception as exc:
+        st.error(f"Erro ao ler {arquivo.name}: {exc}")
 
-    return resultados
-
+    return resultados, detalhes_erros
 
 # ============================================================
-# UPLOAD XML
+# INTERFACE
 # ============================================================
 
-st.subheader("📂 Importação dos XMLs")
+with st.sidebar:
+    st.header("⚙️ Configurações")
+    st.write("Base tributária:")
+    st.code(ARQUIVO_BASE)
 
-uploaded_files = st.file_uploader(
-    "Arraste e solte os XMLs das NF-e aqui",
+    if BASE.empty:
+        st.warning("Base tributária sem regras cadastradas.")
+    else:
+        st.success(f"{len(BASE)} regra(s) carregada(s).")
+
+    st.divider()
+    st.write("Estados:")
+    st.write(", ".join(UFS))
+
+st.subheader("📂 Importar XMLs")
+arquivos = st.file_uploader(
+    "Arraste os XMLs das NF-e para esta área",
     type=["xml"],
     accept_multiple_files=True
 )
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-with st.sidebar:
-
-    st.header("⚙️ Configurações")
-
-    st.write(
-        "A auditoria utiliza a base tributária "
-        "cadastrada no arquivo:"
-    )
-
-    st.code(ARQUIVO_BASE)
-
-    st.divider()
-
-    st.write("📚 Base atual")
-
-    if BASE_TRIBUTARIA.empty:
-
-        st.warning(
-            "A base tributária ainda está vazia."
-        )
-
-    else:
-
-        st.success(
-            f"{len(BASE_TRIBUTARIA)} regras cadastradas."
-        )
-
-    st.divider()
-
-    st.write("Estados disponíveis")
-
-    st.write(
-        ", ".join(sorted(UF_CODIGOS.values()))
-    )
-
-
-# ============================================================
-# IMPORTAÇÃO DA BASE TRIBUTÁRIA
-# ============================================================
-
-st.subheader("📚 Base Tributária")
-
-arquivo_base_upload = st.file_uploader(
-    "Se possuir uma base tributária atualizada, importe aqui",
+# Upload opcional da base
+st.subheader("📚 Base tributária")
+upload_base = st.file_uploader(
+    "Opcional: carregue uma base CSV ou Excel para esta execução",
     type=["csv", "xlsx"],
-    key="base_tributaria_upload"
+    key="upload_base"
 )
 
-if arquivo_base_upload:
+BASE_EXECUCAO = BASE.copy()
 
+if upload_base:
     try:
-
-        if arquivo_base_upload.name.lower().endswith(".csv"):
-
-            nova_base = pd.read_csv(
-                arquivo_base_upload,
+        if upload_base.name.lower().endswith(".csv"):
+            BASE_EXECUCAO = pd.read_csv(
+                upload_base,
                 sep=";",
                 dtype=str,
                 encoding="utf-8-sig"
-            )
-
+            ).fillna("")
         else:
-
-            nova_base = pd.read_excel(
-                arquivo_base_upload,
+            BASE_EXECUCAO = pd.read_excel(
+                upload_base,
                 dtype=str
-            )
+            ).fillna("")
 
-        nova_base = nova_base.fillna("")
+        for col in COLUNAS_BASE:
+            if col not in BASE_EXECUCAO.columns:
+                BASE_EXECUCAO[col] = ""
+
+        BASE_EXECUCAO = BASE_EXECUCAO[COLUNAS_BASE]
+
+        # A variável global é usada pelas funções de busca.
+        BASE = BASE_EXECUCAO
 
         st.success(
-            f"Base carregada: {len(nova_base)} regras."
+            f"Base temporária carregada com {len(BASE)} regra(s)."
         )
-
-        st.dataframe(
-            nova_base,
-            use_container_width=True
-        )
-
-        csv_nova_base = nova_base.to_csv(
-            index=False,
-            sep=";",
-            encoding="utf-8-sig"
-        )
-
-        st.download_button(
-            "⬇️ Baixar base tributária",
-            data=csv_nova_base,
-            file_name="base_tributaria_atualizada.csv",
-            mime="text/csv"
-        )
-
-    except Exception as erro:
-
-        st.error(
-            f"Erro ao carregar base tributária: {erro}"
-        )
-
+    except Exception as exc:
+        st.error(f"Erro ao carregar a base: {exc}")
 
 # ============================================================
-# AUDITORIA
+# EXECUÇÃO
 # ============================================================
 
-if uploaded_files:
-
+if arquivos:
     st.divider()
+    st.subheader("🔎 Auditoria")
 
-    st.subheader("🔎 Processamento")
-
-    resultados_finais = []
+    todos_resultados = []
+    todos_erros = []
 
     barra = st.progress(0)
 
-    total = len(uploaded_files)
+    for i, arquivo in enumerate(arquivos):
+        resultados, erros = processar_xml(arquivo)
+        todos_resultados.extend(resultados)
+        todos_erros.extend(erros)
+        barra.progress((i + 1) / len(arquivos))
 
-    for indice, arquivo in enumerate(uploaded_files):
+    if todos_resultados:
+        df = pd.DataFrame(todos_resultados)
+        df_erros = pd.DataFrame(todos_erros)
 
-        resultados = auditar_xml(arquivo)
-
-        resultados_finais.extend(resultados)
-
-        progresso = int(
-            ((indice + 1) / total) * 100
-        )
-
-        barra.progress(progresso)
-
-    if resultados_finais:
-
-        df_final = pd.DataFrame(resultados_finais)
-
-        st.success(
-            f"✅ Auditoria concluída. "
-            f"{len(uploaded_files)} XML(s) processado(s)."
-        )
-
-        # ====================================================
-        # INDICADORES
-        # ====================================================
-
-        total_itens = len(df_final)
-
-        incorretos = len(
-            df_final[
-                df_final["Status"] == "❌ INCORRETO"
-            ]
-        )
-
-        analisados = len(
-            df_final[
-                df_final["Status"] == "✅ ANALISADO"
-            ]
-        )
-
-        sem_regra = len(
-            df_final[
-                df_final["Status"] == "SEM REGRA"
-            ]
-        )
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric(
-            "Produtos analisados",
-            total_itens
-        )
-
-        col2.metric(
-            "Possíveis divergências",
-            incorretos
-        )
-
-        col3.metric(
-            "Regras encontradas",
-            analisados
-        )
-
-        col4.metric(
-            "Sem regra cadastrada",
-            sem_regra
-        )
-
-        # ====================================================
-        # ABAS
-        # ====================================================
-
-        aba_geral, aba_erros, aba_sem_regra, aba_legislacao = st.tabs(
-            [
-                "📋 Todos os Produtos",
-                "⚠️ NOTAS INCORRETAS / ERROS",
-                "❓ NCMs SEM REGRA",
-                "📚 LEGISLAÇÃO / BASE"
-            ]
-        )
-
-        # ====================================================
-        # ABA GERAL
-        # ====================================================
-
-        with aba_geral:
-
-            st.subheader(
-                "📋 Painel Geral de Auditoria"
+        if df_erros.empty:
+            df_erros = pd.DataFrame(
+                columns=[
+                    "Arquivo", "NF-e", "Item", "Produto", "NCM",
+                    "Tipo de Erro", "Gravidade", "ERRO ENCONTRADO",
+                    "Regra/Referência", "Legislação", "Fundamento Legal"
+                ]
             )
 
+        qtd_erros = len(df_erros)
+        qtd_produtos_com_erro = (
+            df[df["Status"] == "❌ ERRO ENCONTRADO"].shape[0]
+        )
+        qtd_sem_regra = (
+            df[df["Status"] == "⚠️ SEM REGRA TRIBUTÁRIA"].shape[0]
+        )
+        qtd_conforme = (
+            df[df["Status"] == "✅ CONFORME COM A BASE"].shape[0]
+        )
+
+        st.success(
+            f"Auditoria concluída: {len(arquivos)} XML(s) e "
+            f"{len(df)} item(ns) analisado(s)."
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Itens analisados", len(df))
+        c2.metric("🚨 Itens com erro", qtd_produtos_com_erro)
+        c3.metric("⚠️ Sem regra", qtd_sem_regra)
+        c4.metric("✅ Conforme", qtd_conforme)
+
+        aba_geral, aba_erros, aba_sem_regra, aba_base = st.tabs([
+            "📋 TODOS OS PRODUTOS",
+            "⚠️ ERROS ENCONTRADOS",
+            "❓ SEM REGRA TRIBUTÁRIA",
+            "📚 BASE TRIBUTÁRIA"
+        ])
+
+        with aba_geral:
             st.dataframe(
-                df_final,
+                df,
                 use_container_width=True,
                 height=600
             )
 
-        # ====================================================
-        # ABA ERROS
-        # ====================================================
-
         with aba_erros:
-
-            st.subheader(
-                "⚠️ Produtos com possíveis divergências"
-            )
-
-            df_erros = df_final[
-                df_final["Status"] == "❌ INCORRETO"
-            ]
+            st.subheader("🚨 Produtos que apresentam erro")
 
             if df_erros.empty:
-
                 st.success(
-                    "Nenhuma divergência foi identificada "
-                    "com as regras cadastradas."
+                    "Nenhum erro automático foi encontrado nos XMLs."
                 )
-
             else:
-
-                st.dataframe(
-                    df_erros,
-                    use_container_width=True,
-                    height=600
+                st.error(
+                    f"{qtd_erros} divergência(s) encontrada(s)."
                 )
 
-        # ====================================================
-        # ABA SEM REGRA
-        # ====================================================
-
-        with aba_sem_regra:
-
-            st.subheader(
-                "❓ NCMs que ainda não possuem regra cadastrada"
-            )
-
-            df_sem_regra = df_final[
-                df_final["Status"] == "SEM REGRA"
-            ]
-
-            if df_sem_regra.empty:
-
-                st.success(
-                    "Todos os produtos encontrados "
-                    "possuem alguma regra cadastrada."
+                # Filtro de gravidade
+                gravidades = sorted(
+                    df_erros["Gravidade"].dropna().unique().tolist()
                 )
 
-            else:
+                selecionadas = st.multiselect(
+                    "Filtrar gravidade",
+                    gravidades,
+                    default=gravidades
+                )
 
-                colunas = [
-                    "UF Origem",
-                    "UF Destino",
-                    "Produto",
-                    "NCM",
-                    "CEST",
-                    "CFOP"
+                exibicao = df_erros[
+                    df_erros["Gravidade"].isin(selecionadas)
                 ]
 
                 st.dataframe(
-                    df_sem_regra[colunas].drop_duplicates(),
-                    use_container_width=True
-                )
-
-                st.info(
-                    "Esses NCMs precisam ser incluídos "
-                    "na base tributária oficial antes "
-                    "de uma conclusão fiscal."
-                )
-
-        # ====================================================
-        # ABA LEGISLAÇÃO
-        # ====================================================
-
-        with aba_legislacao:
-
-            st.subheader(
-                "📚 Base de Legislação Tributária"
-            )
-
-            if BASE_TRIBUTARIA.empty:
-
-                st.warning(
-                    "Nenhuma regra foi cadastrada."
-                )
-
-            else:
-
-                st.dataframe(
-                    BASE_TRIBUTARIA,
+                    exibicao,
                     use_container_width=True,
                     height=600
                 )
 
-        # ====================================================
+                st.download_button(
+                    "⬇️ Baixar somente os erros em CSV",
+                    data=exibicao.to_csv(
+                        index=False,
+                        sep=";",
+                        encoding="utf-8-sig"
+                    ).encode("utf-8-sig"),
+                    file_name="erros_encontrados.csv",
+                    mime="text/csv"
+                )
+
+        with aba_sem_regra:
+            sem_regra = df[
+                df["Status"] == "⚠️ SEM REGRA TRIBUTÁRIA"
+            ]
+
+            if sem_regra.empty:
+                st.success(
+                    "Todos os itens possuem regra na base."
+                )
+            else:
+                st.warning(
+                    f"{len(sem_regra)} item(ns) não possuem "
+                    "regra tributária cadastrada."
+                )
+                st.dataframe(
+                    sem_regra[
+                        [
+                            "Arquivo", "NF-e", "Produto", "NCM",
+                            "CEST", "CFOP", "UF Origem", "UF Destino"
+                        ]
+                    ].drop_duplicates(),
+                    use_container_width=True
+                )
+
+        with aba_base:
+            if BASE.empty:
+                st.info(
+                    "A base ainda está vazia. Você pode carregar "
+                    "um CSV/XLSX ou alimentar base_tributaria.csv."
+                )
+            else:
+                st.dataframe(
+                    BASE,
+                    use_container_width=True,
+                    height=600
+                )
+
+        # ========================================================
         # EXPORTAÇÃO EXCEL
-        # ====================================================
+        # ========================================================
 
         st.divider()
+        st.subheader("📥 Exportar auditoria")
 
-        st.subheader(
-            "📥 Exportar Auditoria"
-        )
+        try:
+            buffer = io.BytesIO()
 
-        buffer = io.BytesIO()
+            with pd.ExcelWriter(
+                buffer,
+                engine="openpyxl"
+            ) as writer:
+                df.to_excel(
+                    writer,
+                    index=False,
+                    sheet_name="Todos_Produtos"
+                )
+                df_erros.to_excel(
+                    writer,
+                    index=False,
+                    sheet_name="ERROS_ENCONTRADOS"
+                )
+                df[
+                    df["Status"] == "⚠️ SEM REGRA TRIBUTÁRIA"
+                ].to_excel(
+                    writer,
+                    index=False,
+                    sheet_name="SEM_REGRA"
+                )
 
-        with pd.ExcelWriter(
-            buffer,
-            engine="openpyxl"
-        ) as writer:
+            buffer.seek(0)
 
-            df_final.to_excel(
-                writer,
-                index=False,
-                sheet_name="Auditoria"
+            st.download_button(
+                "⬇️ BAIXAR AUDITORIA COMPLETA EM EXCEL",
+                data=buffer.getvalue(),
+                file_name=(
+                    "auditoria_tributaria_"
+                    + datetime.now().strftime("%Y%m%d_%H%M%S")
+                    + ".xlsx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                on_click="ignore"
             )
 
-            df_erros = df_final[
-                df_final["Status"] == "❌ INCORRETO"
-            ]
-
-            df_erros.to_excel(
-                writer,
-                index=False,
-                sheet_name="Divergencias"
+        except Exception as exc:
+            st.warning(
+                "Não foi possível gerar o Excel. "
+                "Verifique se openpyxl está no requirements.txt. "
+                f"Detalhe: {exc}"
             )
 
-            df_sem_regra = df_final[
-                df_final["Status"] == "SEM REGRA"
-            ]
-
-            df_sem_regra.to_excel(
-                writer,
-                index=False,
-                sheet_name="Sem_Regra"
-            )
-
-        buffer.seek(0)
-
-        st.download_button(
-            label="⬇️ BAIXAR AUDITORIA EM EXCEL",
-            data=buffer,
-            file_name=(
-                "auditoria_tributaria_"
-                + datetime.now().strftime("%Y%m%d_%H%M%S")
-                + ".xlsx"
-            ),
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            )
-        )
-
-    else:
-
-        st.warning(
-            "Os XMLs foram carregados, mas nenhum produto "
-            "foi encontrado para análise."
-        )
-
+else:
+    st.info(
+        "👆 Envie um ou mais XMLs para iniciar a auditoria."
+    )
 
 # ============================================================
-# MODELO DA BASE TRIBUTÁRIA
+# MODELO DE BASE
 # ============================================================
 
 st.divider()
+st.subheader("🧾 Modelo da base tributária")
 
-st.subheader(
-    "🧾 Modelo da Base Tributária"
-)
+modelo = pd.DataFrame([{
+    "UF_ORIGEM": "SP",
+    "UF_DESTINO": "PE",
+    "NCM": "00000000",
+    "CEST": "",
+    "CFOP": "5102",
+    "REGIME": "Simples Nacional",
+    "ICMS": "NORMAL",
+    "ICMS_ST": "NAO",
+    "DIFAL": "NAO",
+    "FCP": "NAO",
+    "PIS_COFINS": "NORMAL",
+    "IPI": "NORMAL",
+    "IBS_CBS": "ANALISAR",
+    "ALIQUOTA_ICMS": "",
+    "MVA": "",
+    "REDUCAO_BASE": "",
+    "CODIGO_BENEFICIO": "",
+    "LEGISLACAO": "",
+    "FUNDAMENTO_LEGAL": "",
+    "OBSERVACAO": ""
+}], columns=COLUNAS_BASE)
 
-st.write(
-    "Use este modelo para alimentar as regras tributárias "
-    "por NCM, CEST, UF, CFOP e legislação."
-)
-
-modelo_base = pd.DataFrame(
-    [
-        {
-            "UF_ORIGEM": "SP",
-            "UF_DESTINO": "PE",
-            "NCM": "00000000",
-            "CEST": "",
-            "CFOP": "5102",
-            "REGIME": "Simples Nacional",
-            "ICMS": "NORMAL",
-            "ICMS_ST": "NAO",
-            "DIFAL": "NAO",
-            "FCP": "NAO",
-            "PIS_COFINS": "NORMAL",
-            "IPI": "NORMAL",
-            "IBS_CBS": "ANALISAR",
-            "ALIQUOTA_ICMS": "",
-            "MVA": "",
-            "REDUCAO_BASE": "",
-            "CODIGO_BENEFICIO": "",
-            "LEGISLACAO": "",
-            "FUNDAMENTO_LEGAL": "",
-            "OBSERVACAO": ""
-        }
-    ],
-    columns=COLUNAS_BASE
-)
-
-st.dataframe(
-    modelo_base,
-    use_container_width=True
-)
-
-csv_modelo = modelo_base.to_csv(
-    index=False,
-    sep=";",
-    encoding="utf-8-sig"
-)
+st.dataframe(modelo, use_container_width=True)
 
 st.download_button(
-    "⬇️ Baixar modelo da Base Tributária",
-    data=csv_modelo,
+    "⬇️ Baixar modelo CSV da base",
+    data=modelo.to_csv(
+        index=False,
+        sep=";",
+        encoding="utf-8-sig"
+    ).encode("utf-8-sig"),
     file_name="modelo_base_tributaria.csv",
-    mime="text/csv"
+    mime="text/csv",
+    on_click="ignore"
 )
 
-# ============================================================
-# RODAPÉ
-# ============================================================
-
-st.divider()
-
 st.caption(
-    "Auditor Fiscal de Divergências — análise automatizada "
-    "de XML. A indicação de divergência depende da qualidade "
-    "e atualização da base tributária utilizada."
+    "V2: erros estruturais são identificados diretamente no XML. "
+    "Conclusões tributárias de ICMS-ST, monofásico, DIFAL etc. "
+    "dependem da base legislativa cadastrada e não devem ser "
+    "inventadas pelo sistema."
 )
