@@ -79,8 +79,8 @@ def gerar_pdf_relatorio(dataframe):
         ]
         dados_tabela.append(linha)
     
-    # 7 colunas - Definido largura fixa de cada uma para evitar erros (Soma total = 750)
-    tabela_pdf = Table(dados_tabela, colWidths=[60, 30, 310, 70, 90, 110, 80])
+    # Criando a tabela sem larguras estáticas - O ReportLab calcula automaticamente
+    tabela_pdf = Table(dados_tabela)
     
     tabela_pdf.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1C3D5A')),
@@ -167,4 +167,4 @@ def auditoria_lote_divergencias(xml_files):
                         
                     else:
                         regra_icms = "NORMAL"
-
+                        regra_pis_cofins = "NORMAL"
