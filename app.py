@@ -1,243 +1,231 @@
-import streamlit as st
+import os
+import glob
 import xml.etree.ElementTree as ET
 import pandas as pd
-import io
-import os
-import re
-from datetime import datetime
+from typing import Dict, List, Any
 
-# ============================================================ #
-# AUDITOR FISCAL XML - V2.3 (CORRIGIDO PARA TELA PRINCIPAL)
-# ============================================================ #
-st.set_page_config(
-    page_title="Auditor Fiscal de Divergências",
-    page_icon="📊",
-    layout="wide"
-)
-
-st.title("📊 Auditor Fiscal de Divergências - V2")
-st.caption(
-    "Leitura de NF-e XML + auditoria automática de inconsistências "
-    "e comparação com base tributária automatizada."
-)
-
-# ============================================================ #
-# CONSTANTES
-# ============================================================ #
-UF_CODIGOS = {
-    "11": "RO", "12": "AC", "13": "AM", "14": "RR", "15": "PA", "16": "AP", "17": "TO",
-    "21": "MA", "22": "PI", "23": "CE", "24": "RN", "25": "PB", "26": "PE", "27": "AL",
-    "28": "SE", "29": "BA", "31": "MG", "32": "ES", "33": "RJ", "35": "SP", "41": "PR",
-    "42": "SC", "43": "RS", "50": "MS", "51": "MT", "52": "GO", "53": "DF"
-}
-UFS = sorted(UF_CODIGOS.values())
-
-COLUNAS_BASE = [
-    "UF_ORIGEM", "UF_DESTINO", "NCM", "CEST", "CFOP", "REGIME", "ICMS", "ICMS_ST", 
-    "DIFAL", "FCP", "PIS_COFINS", "IPI", "IBS_CBS", "ALIQUOTA_ICMS", "MVA", 
-    "REDUCAO_BASE", "CODIGO_BENEFICIO", "LEGISLACAO", "FUNDAMENTO_LEGAL", "OBSERVACAO"
-]
-ARQUIVO_BASE = "base_tributaria.csv"
-
-# ============================================================ #
-# FUNÇÕES BÁSICAS
-# ============================================================ #
-def normalizar(valor):
-    return str(valor or "").strip()
-
-def somente_digitos(valor):
-    return re.sub(r"\D", "", normalizar(valor))
-
-def normalizar_ncm(valor):
-    v = somente_digitos(valor)
-    return v.zfill(8) if v else ""
-
-def normalizar_cest(valor):
-    return somente_digitos(valor)
-
-def normalizar_cfop(valor):
-    return somente_digitos(valor)
-
-def tag_final(elemento):
-    return elemento.tag.split("}")[-1]
-
-def texto(elemento):
-    return normalizar(elemento.text if elemento is not None else "")
-
-def encontrar(parent, nome):
-    for el in parent.iter():
-        if tag_final(el) == nome:
-            return el
-    return None
-
-def encontrar_texto(parent, nome):
-    return texto(encontrar(parent, nome))
-
-# ============================================================ #
-# GERAÇÃO AUTOMÁTICA DA BASE LEGAL (MONOFÁSICOS E ST)
-# ============================================================ #
-def gerar_e_alimentar_base_nacional():
-    regras = []
+class AuditarXMLFiscal:
+    """
+    Engine de Auditoria Fiscal de NFe em lote.
+    Valida NCM, CST/CSOSN, PIS/COFINS Monofásico, ICMS ST e inconsistências tributárias.
+    """
     
-    # 1. PIS/COFINS MONOFÁSICO
-    grupos_monofasicos = [
-        {"NCM_START": "3003", "DESC": "Medicamentos", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3004", "DESC": "Medicamentos Humana/Veterinária", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3303", "DESC": "Perfumes e cosméticos", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3304", "DESC": "Produtos de beleza/maquiagem", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3305", "DESC": "Produtos para o cabelo", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3307", "DESC": "Produtos para barbear, desodorantes", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "8702", "DESC": "Veículos transporte coletivo", "LEI": "Lei nº 10.485/2002"},
-        {"NCM_START": "8703", "DESC": "Automóveis de passageiros", "LEI": "Lei nº 10.485/2002"},
-        {"NCM_START": "4011", "DESC": "Pneumáticos novos de borracha", "LEI": "Lei nº 10.485/2002"},
-        {"NCM_START": "2201", "DESC": "Águas minerais", "LEI": "Lei nº 10.833/2003"},
-        {"NCM_START": "2202", "DESC": "Refrigerantes e sucos adicionados de açúcar", "LEI": "Lei nº 10.833/2003"},
-        {"NCM_START": "2203", "DESC": "Cervejas de malte", "LEI": "Lei nº 10.833/2003"},
-        {"NCM_START": "2710", "DESC": "Combustíveis e óleos minerais", "LEI": "Lei nº 9.718/1998 / LC 192/22"}
-    ]
-    
-    for grupo in grupos_monofasicos:
-        regras.append({
-            "UF_ORIGEM": "", "UF_DESTINO": "", "NCM": grupo["NCM_START"], "CEST": "", "CFOP": "",
-            "REGIME": "", "ICMS": "", "ICMS_ST": "", "DIFAL": "", "FCP": "",
-            "PIS_COFINS": "MONOFÁSICO", "IPI": "", "IBS_CBS": "", "ALIQUOTA_ICMS": "", "MVA": "",
-            "REDUCAO_BASE": "", "CODIGO_BENEFICIO": "", "LEGISLACAO": "Federal",
-            "FUNDAMENTO_LEGAL": grupo["LEI"], "OBSERVACAO": f"Grupo Monofásico: {grupo['DESC']}"
-        })
+    # Namespace padrão da NF-e (Ajustar conforme versão)
+    NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+
+    def __init__(self, matriz_tributaria: Dict[str, Dict[str, Any]]):
+        """
+        :param matriz_tributaria: Dicionário contendo as regras por NCM e Legislação.
+        """
+        self.matriz_tributaria = matriz_tributaria
+
+    def extrair_dados_xml(self, caminho_xml: str) -> List[Dict[str, Any]]:
+        """Abre o XML, trata erros de estrutura e extrai os itens para análise."""
+        itens = []
+        nome_arquivo = os.path.basename(caminho_xml)
         
-    # 2. ICMS ST
-    segmentos_st = [
-        {"NCM_START": "2203", "DESC": "Cervejas, Chopes e afins"},
-        {"NCM_START": "2402", "DESC": "Cigarros e tabaco"},
-        {"NCM_START": "2710", "DESC": "Combustíveis e lubrificantes"},
-        {"NCM_START": "4011", "DESC": "Pneumáticos e Câmaras de ar"},
-        {"NCM_START": "3004", "DESC": "Produtos farmacêuticos"},
-        {"NCM_START": "3304", "DESC": "Cosméticos e Perfumaria"}
-    ]
-    
-    for seg in segmentos_st:
-        regras.append({
-            "UF_ORIGEM": "", "UF_DESTINO": "", "NCM": seg["NCM_START"], "CEST": "", "CFOP": "",
-            "REGIME": "", "ICMS": "ST", "ICMS_ST": "SIM", "DIFAL": "", "FCP": "",
-            "PIS_COFINS": "", "IPI": "", "IBS_CBS": "", "ALIQUOTA_ICMS": "", "MVA": "",
-            "REDUCAO_BASE": "", "CODIGO_BENEFICIO": "", "LEGISLACAO": "Convênio ICMS 142/18",
-            "FUNDAMENTO_LEGAL": "Diretriz Geral do Convênio ICMS 142/18",
-            "OBSERVACAO": f"Segmento passível de ST nacionalmente: {seg['DESC']}"
-        })
+        try:
+            tree = ET.parse(caminho_xml)
+            root = tree.getroot()
+            
+            # Trata se o XML possui nó NFe ou nfeProc
+            if root.tag.endswith('nfeProc'):
+                infNfe = root.find('.//nfe:infNFe', self.NS)
+            elif root.tag.endswith('NFe'):
+                infNfe = root.find('.//nfe:infNFe', self.NS)
+            else:
+                infNfe = root
+                
+            if infNfe is None:
+                return [{'arquivo': nome_arquivo, 'erro_xml': 'Estrutura de XML NFe inválida'}]
+
+            ide = infNfe.find('nfe:ide', self.NS)
+            uf_emit = infNfe.find('.//nfe:emit/nfe:enderEmit/nfe:UF', self.NS)
+            uf_dest = infNfe.find('.//nfe:dest/nfe:enderDest/nfe:UF', self.NS)
+            
+            uf_origem = uf_emit.text if uf_emit is not None else ''
+            uf_destino = uf_dest.text if uf_dest is not None else ''
+            num_nota = ide.find('nfe:nNF', self.NS).text if ide is not None and ide.find('nfe:nNF', self.NS) is not None else 'N/A'
+
+            # Iterar sobre os itens da nota (det)
+            for det in infNfe.findall('nfe:det', self.NS):
+                num_item = det.attrib.get('nItem', '1')
+                prod = det.find('nfe:prod', self.NS)
+                imposto = det.find('nfe:imposto', self.NS)
+                
+                ncm = prod.find('nfe:NCM', self.NS).text if prod.find('nfe:NCM', self.NS) is not None else ''
+                descricao = prod.find('nfe:xProd', self.NS).text if prod.find('nfe:xProd', self.NS) is not None else ''
+                
+                # Extrair Tributos Informados na Nota
+                cst_pis, cst_cofins, cst_icms = '', '', ''
+                
+                if imposto is not None:
+                    # PIS
+                    pis = imposto.find('.//nfe:PIS', self.NS)
+                    if pis is not None and len(pis) > 0:
+                        cst_pis_el = pis[0].find('nfe:CST', self.NS)
+                        cst_pis = cst_pis_el.text if cst_pis_el is not None else ''
+                    
+                    # COFINS
+                    cofins = imposto.find('.//nfe:COFINS', self.NS)
+                    if cofins is not None and len(cofins) > 0:
+                        cst_cofins_el = cofins[0].find('nfe:CST', self.NS)
+                        cst_cofins = cst_cofins_el.text if cst_cofins_el is not None else ''
+                        
+                    # ICMS
+                    icms = imposto.find('.//nfe:ICMS', self.NS)
+                    if icms is not None and len(icms) > 0:
+                        cst_icms_el = icms[0].find('nfe:CST', self.NS)
+                        if cst_icms_el is None:
+                            cst_icms_el = icms[0].find('nfe:CSOSN', self.NS)
+                        cst_icms = cst_icms_el.text if cst_icms_el is not None else ''
+
+                itens.append({
+                    'arquivo': nome_arquivo,
+                    'numero_nota': num_nota,
+                    'uf_origem': uf_origem,
+                    'uf_destino': uf_destino,
+                    'item': num_item,
+                    'descricao': descricao,
+                    'ncm': ncm,
+                    'cst_pis_informado': cst_pis,
+                    'cst_cofins_informado': cst_cofins,
+                    'cst_icms_informado': cst_icms,
+                    'erro_xml': ''
+                })
+
+        except ET.ParseError:
+            return [{'arquivo': nome_arquivo, 'erro_xml': 'Arquivo XML corrompido ou malformado'}]
+        except Exception as e:
+            return [{'arquivo': nome_arquivo, 'erro_xml': f'Erro ao processar: {str(e)}'}]
+            
+        return itens
+
+    def auditar_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Aplica regras fiscais comparando informado x esperado segundo a legislação."""
+        if item.get('erro_xml'):
+            item['status_auditoria'] = 'ERRO_XML'
+            item['inconsistencias'] = item['erro_xml']
+            return item
+
+        ncm = item['ncm']
+        inconsistencias = []
         
-    df_inicial = pd.DataFrame(regras, columns=COLUNAS_BASE)
-    df_inicial.to_csv(ARQUIVO_BASE, index=False, sep=";", encoding="utf-8-sig")
+        # Consulta a base legal referente ao NCM do produto
+        regra_fiscal = self.matriz_tributaria.get(ncm)
 
-def carregar_base():
-    if not os.path.exists(ARQUIVO_BASE):
-        gerar_e_alimentar_base_nacional()
-    try:
-        df = pd.read_csv(ARQUIVO_BASE, sep=";", dtype=str, encoding="utf-8-sig").fillna("")
-        if df.empty:
-            gerar_e_alimentar_base_nacional()
-            df = pd.read_csv(ARQUIVO_BASE, sep=";", dtype=str, encoding="utf-8-sig").fillna("")
-    except Exception:
-        return pd.DataFrame(columns=COLUNAS_BASE)
+        if not regra_fiscal:
+            item['status_auditoria'] = 'NCM_NAO_MAPEADA'
+            item['inconsistencias'] = 'NCM não localizado na base legal de referência.'
+            item['legislacao_aplicavel'] = 'N/A'
+            item['tributacao_correta'] = 'N/A'
+            return item
+
+        # 1. Auditoria Monofásico (PIS/COFINS)
+        if regra_fiscal.get('is_monofasico'):
+            cst_pis_esperado = regra_fiscal.get('cst_pis_correto', '04')
+            if item['cst_pis_informado'] != cst_pis_esperado:
+                inconsistencias.append(
+                    f"PIS Incorreto: Informado CST {item['cst_pis_informado']}, esperado CST {cst_pis_esperado} (Monofásico)."
+                )
+
+        # 2. Auditoria de ICMS Substituição Tributária (ST)
+        if regra_fiscal.get('tem_st'):
+            cst_icms_esperado = regra_fiscal.get('cst_icms_correto', '60')
+            if item['cst_icms_informado'] != cst_icms_esperado:
+                inconsistencias.append(
+                    f"ICMS ST Incorreto: Informado CST {item['cst_icms_informado']}, esperado CST {cst_icms_esperado} (ST)."
+                )
+
+        # Resultado da Auditoria
+        if inconsistencias:
+            item['status_auditoria'] = 'INCONSISTENTE'
+            item['inconsistencias'] = ' | '.join(inconsistencias)
+            item['legislacao_aplicavel'] = regra_fiscal.get('base_legal', 'Não especificada')
+            item['tributacao_correta'] = (
+                f"PIS/COFINS CST {regra_fiscal.get('cst_pis_correto')}, "
+                f"ICMS CST {regra_fiscal.get('cst_icms_correto')} ({regra_fiscal.get('descricao_regra')})"
+            )
+        else:
+            item['status_auditoria'] = 'CONFORME'
+            item['inconsistencias'] = 'Nenhuma'
+            item['legislacao_aplicavel'] = regra_fiscal.get('base_legal', 'Em conformidade')
+            item['tributacao_correta'] = 'Tributação declarada corretamente'
+
+        return item
+
+    def processar_lote(self, pasta_xmls: str) -> pd.DataFrame:
+        """Executa a importação em lote de todos os XMLs de um diretório."""
+        arquivos_xml = glob.glob(os.path.join(pasta_xmls, "*.xml"))
+        resultado_final = []
+
+        print(f"Iniciando processamento de {len(arquivos_xml)} arquivos XML...")
+
+        for caminho in arquivos_xml:
+            itens_xml = self.extrair_dados_xml(caminho)
+            for item in itens_xml:
+                item_auditado = self.auditar_item(item)
+                resultado_final.append(item_auditado)
+
+        df_relatorio = pd.DataFrame(resultado_final)
+        return df_relatorio
+
+
+# ==========================================
+# EXEMPLO DE USO COM BASE LEGAL DE REFERÊNCIA
+# ==========================================
+if __name__ == "__main__":
     
-    for col in COLUNAS_BASE:
-        if col not in df.columns:
-            df[col] = ""
-    return df[COLUNAS_BASE]
-
-if "base_tributaria" not in st.session_state:
-    st.session_state["base_tributaria"] = carregar_base()
-
-# ============================================================ #
-# LEITURA DA NF-E
-# ============================================================ #
-def identificar_uf_origem(root):
-    cuf = encontrar_texto(root, "cUF")
-    return UF_CODIGOS.get(cuf, "")
-
-def identificar_uf_destino(root):
-    dest = None
-    for el in root.iter():
-        if tag_final(el) == "dest":
-            dest = el
-            break
-    if dest is not None:
-        return encontrar_texto(dest, "UF")
-    return ""
-
-def extrair_dados_nfe(root):
-    return {
-        "NF-e": encontrar_texto(root, "nNF"),
-        "Série": encontrar_texto(root, "serie"),
-        "Data Emissão": encontrar_texto(root, "dhEmi") or encontrar_texto(root, "dEmi"),
-        "Natureza": encontrar_texto(root, "natOp"),
-        "UF Origem": identificar_uf_origem(root),
-        "UF Destino": identificar_uf_destino(root),
-        "CNPJ Emitente": somente_digitos(encontrar_texto(root, "CNPJ")),
+    # Exemplo de Matriz Tributária (Regras por NCM com Fundamentação Legal)
+    MATRIZ_LEGISLECAO_EXEMPLO = {
+        # Bebidas / Refrigerantes (Monofásico de PIS/COFINS + ICMS ST)
+        '22021000': {
+            'is_monofasico': True,
+            'cst_pis_correto': '04',
+            'tem_st': True,
+            'cst_icms_correto': '60',
+            'base_legal': 'Lei 10.833/2003 Art. 1º / Convênio ICMS 142/2018',
+            'descricao_regra': 'Sujeito à incidência Monofásica de PIS/COFINS e Substituição Tributária de ICMS'
+        },
+        # Medicamentos (Monofásico de PIS/COFINS)
+        '30049099': {
+            'is_monofasico': True,
+            'cst_pis_correto': '04',
+            'tem_st': False,
+            'cst_icms_correto': '00',
+            'base_legal': 'Lei 10.147/2000 Art. 1º',
+            'descricao_regra': 'Produtos farmacêuticos sujeitos à alíquota zero/monofásica'
+        },
+        # Peças automotivas (ICMS ST)
+        '87082990': {
+            'is_monofasico': False,
+            'cst_pis_correto': '01',
+            'tem_st': True,
+            'cst_icms_correto': '60',
+            'base_legal': 'Convênio ICMS 109/08 e legislação estadual correlata',
+            'descricao_regra': 'Autopeças sujeitas à Substituição Tributária'
+        }
     }
 
-# ============================================================ #
-# EXTRAÇÃO DOS ITENS
-# ============================================================ #
-def extrair_itens(root):
-    itens = []
-    for det in root.iter():
-        if tag_final(det) != "det":
-            continue
-        prod = None
-        imposto = None
-        for filho in det:
-            nome = tag_final(filho)
-            if nome == "prod":
-                prod = filho
-            elif nome == "imposto":
-                imposto = filho
-        if prod is None:
-            continue
-            
-        ncm = normalizar_ncm(encontrar_texto(prod, "NCM"))
-        cest = normalizar_cest(encontrar_texto(prod, "CEST"))
-        cfop = normalizar_cfop(encontrar_texto(prod, "CFOP"))
-        
-        item = {
-            "Item": det.attrib.get("nItem", ""),
-            "Produto": encontrar_texto(prod, "xProd"),
-            "NCM": ncm,
-            "CEST": cest,
-            "CFOP": cfop,
-            "cProd": encontrar_texto(prod, "cProd"),
-            "Quantidade": encontrar_texto(prod, "qCom"),
-            "Valor Unitário": encontrar_texto(prod, "vUnCom"),
-            "Valor Produto": encontrar_texto(prod, "vProd"),
-            "CST ICMS": "", "CSOSN ICMS": "", "Origem ICMS": "", "Modalidade BC ICMS": "",
-            "Alíquota ICMS": "", "Valor ICMS": "", "CST PIS": "", "CST COFINS": "", "CST IPI": "",
-        }
-        
-        if imposto is not None:
-            for el in imposto.iter():
-                nome = tag_final(el)
-                if nome == "orig":
-                    item["Origem ICMS"] = texto(el)
-                elif nome == "CST" and not item["CST ICMS"]:
-                    item["CST ICMS"] = texto(el)
-                elif nome == "CSOSN":
-                    item["CSOSN ICMS"] = texto(el)
-                elif nome == "modBC":
-                    item["Modalidade BC ICMS"] = texto(el)
-                elif nome == "pICMS":
-                    item["Alíquota ICMS"] = texto(el)
-                elif nome == "vICMS":
-                    item["Valor ICMS"] = texto(el)
-                    
-        for el in det.iter():
-            tag = tag_final(el)
-            if tag in ["PIS", "COFINS", "IPI"]:
-                for filho in el.iter():
-                    if tag_final(filho) == "CST":
-                        item[f"CST {tag}"] = texto(filho)
-                        break
-        itens.append(item)
-    return itens
+    # Instancia o auditor com a base tributária
+    auditor = AuditarXMLFiscal(matriz_tributaria=MATRIZ_LEGISLECAO_EXEMPLO)
 
-# ============================================================ #
-# REGRAS AUTOMÁTICAS DE CONSISTÊNCIA
-# ============================================================ #
+    # Pasta onde os arquivos .xml se encontram
+    PASTA_INPUT_XML = "./xmls_entrada"
+
+    # Criar diretório de teste caso não exista
+    if not os.path.exists(PASTA_INPUT_XML):
+        os.makedirs(PASTA_INPUT_XML)
+        print(f"Diretório '{PASTA_INPUT_XML}' criado. Coloque seus arquivos XML nele e execute novamente.")
+    else:
+        # Processar os arquivos
+        df_resultado = auditor.processar_lote(PASTA_INPUT_XML)
+        
+        # Exibe no console
+        print("\n--- RESUMO DA AUDITORIA FISCAL ---")
+        print(df_resultado[['numero_nota', 'ncm', 'status_auditoria', 'inconsistencias', 'legislacao_aplicavel']])
+
+        # Salva o resultado detalhado em um arquivo Excel para análise profissional
+        caminho_excel = "Relatorio_Auditoria_Fiscal_XML.xlsx"
+        df_resultado.to_excel(caminho_excel, index=False)
+        print(f"\nRelatório final gerado com sucesso em: {caminho_excel}")
