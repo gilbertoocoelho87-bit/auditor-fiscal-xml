@@ -7,13 +7,12 @@ import re
 from datetime import datetime
 
 # ============================================================ #
-# AUDITOR FISCAL XML - V2.2 (CORRIGIDO)
+# AUDITOR FISCAL XML - V2.3 (CORRIGIDO PARA TELA PRINCIPAL)
 # ============================================================ #
 st.set_page_config(
     page_title="Auditor Fiscal de Divergências",
     page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"  # <-- FORÇA A BARRA LATERAL A FICAR ABERTA
+    layout="wide"
 )
 
 st.title("📊 Auditor Fiscal de Divergências - V2")
@@ -145,7 +144,6 @@ def carregar_base():
             df[col] = ""
     return df[COLUNAS_BASE]
 
-# Inicializa a base no Session State para evitar conflitos de escopo local/global
 if "base_tributaria" not in st.session_state:
     st.session_state["base_tributaria"] = carregar_base()
 
@@ -242,3 +240,4 @@ def extrair_itens(root):
 
 # ============================================================ #
 # REGRAS AUTOMÁTICAS DE CONSISTÊNCIA
+# ============================================================ #
