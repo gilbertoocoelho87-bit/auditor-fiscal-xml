@@ -7,13 +7,15 @@ import re
 from datetime import datetime
 
 # ============================================================ #
-# AUDITOR FISCAL XML - V2
+# AUDITOR FISCAL XML - V2.2 (CORRIGIDO)
 # ============================================================ #
 st.set_page_config(
     page_title="Auditor Fiscal de Divergências",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"  # <-- FORÇA A BARRA LATERAL A FICAR ABERTA
 )
+
 st.title("📊 Auditor Fiscal de Divergências - V2")
 st.caption(
     "Leitura de NF-e XML + auditoria automática de inconsistências "
@@ -76,27 +78,25 @@ def encontrar_texto(parent, nome):
 # GERAÇÃO AUTOMÁTICA DA BASE LEGAL (MONOFÁSICOS E ST)
 # ============================================================ #
 def gerar_e_alimentar_base_nacional():
-    """Gera regras pré-moldadas baseadas na Lei Federal de Monofásicos e regras macro de ST"""
     regras = []
     
-    # 1. PIS/COFINS MONOFÁSICO (Principais Grupos Nacionais)
+    # 1. PIS/COFINS MONOFÁSICO
     grupos_monofasicos = [
         {"NCM_START": "3003", "DESC": "Medicamentos", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3004", "DESC": "Medicamentos para medicina humana/veterinária", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3303", "DESC": "Perfumes e águas-de-colônia", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "3304", "DESC": "Produtos de beleza ou de maquilagem", "LEI": "Lei nº 10.147/2000"},
+        {"NCM_START": "3004", "DESC": "Medicamentos Humana/Veterinária", "LEI": "Lei nº 10.147/2000"},
+        {"NCM_START": "3303", "DESC": "Perfumes e cosméticos", "LEI": "Lei nº 10.147/2000"},
+        {"NCM_START": "3304", "DESC": "Produtos de beleza/maquiagem", "LEI": "Lei nº 10.147/2000"},
         {"NCM_START": "3305", "DESC": "Produtos para o cabelo", "LEI": "Lei nº 10.147/2000"},
         {"NCM_START": "3307", "DESC": "Produtos para barbear, desodorantes", "LEI": "Lei nº 10.147/2000"},
-        {"NCM_START": "8702", "DESC": "Veículos automóveis para transporte de 10 pessoas ou mais", "LEI": "Lei nº 10.485/2002"},
-        {"NCM_START": "8703", "DESC": "Automóveis de passageiros e outros veículos", "LEI": "Lei nº 10.485/2002"},
+        {"NCM_START": "8702", "DESC": "Veículos transporte coletivo", "LEI": "Lei nº 10.485/2002"},
+        {"NCM_START": "8703", "DESC": "Automóveis de passageiros", "LEI": "Lei nº 10.485/2002"},
         {"NCM_START": "4011", "DESC": "Pneumáticos novos de borracha", "LEI": "Lei nº 10.485/2002"},
-        {"NCM_START": "2201", "DESC": "Águas minerais e águas gaseificadas", "LEI": "Lei nº 10.833/2003"},
-        {"NCM_START": "2202", "DESC": "Águas adicionadas de açúcar, refrigerantes", "LEI": "Lei nº 10.833/2003"},
+        {"NCM_START": "2201", "DESC": "Águas minerais", "LEI": "Lei nº 10.833/2003"},
+        {"NCM_START": "2202", "DESC": "Refrigerantes e sucos adicionados de açúcar", "LEI": "Lei nº 10.833/2003"},
         {"NCM_START": "2203", "DESC": "Cervejas de malte", "LEI": "Lei nº 10.833/2003"},
         {"NCM_START": "2710", "DESC": "Combustíveis e óleos minerais", "LEI": "Lei nº 9.718/1998 / LC 192/22"}
     ]
     
-    # Criar mapeamento simplificado expandindo para regras na tabela
     for grupo in grupos_monofasicos:
         regras.append({
             "UF_ORIGEM": "", "UF_DESTINO": "", "NCM": grupo["NCM_START"], "CEST": "", "CFOP": "",
@@ -106,13 +106,13 @@ def gerar_e_alimentar_base_nacional():
             "FUNDAMENTO_LEGAL": grupo["LEI"], "OBSERVACAO": f"Grupo Monofásico: {grupo['DESC']}"
         })
         
-    # 2. DIRETRIZES DE ICMS ST (Convênio ICMS 142/18) - Segmentos clássicos
+    # 2. ICMS ST
     segmentos_st = [
         {"NCM_START": "2203", "DESC": "Cervejas, Chopes e afins"},
-        {"NCM_START": "2402", "DESC": "Cigarros e sucedâneos de tabaco"},
+        {"NCM_START": "2402", "DESC": "Cigarros e tabaco"},
         {"NCM_START": "2710", "DESC": "Combustíveis e lubrificantes"},
         {"NCM_START": "4011", "DESC": "Pneumáticos e Câmaras de ar"},
-        {"NCM_START": "3004", "DESC": "Produtos farmacêuticos de uso humano"},
+        {"NCM_START": "3004", "DESC": "Produtos farmacêuticos"},
         {"NCM_START": "3304", "DESC": "Cosméticos e Perfumaria"}
     ]
     
@@ -122,7 +122,7 @@ def gerar_e_alimentar_base_nacional():
             "REGIME": "", "ICMS": "ST", "ICMS_ST": "SIM", "DIFAL": "", "FCP": "",
             "PIS_COFINS": "", "IPI": "", "IBS_CBS": "", "ALIQUOTA_ICMS": "", "MVA": "",
             "REDUCAO_BASE": "", "CODIGO_BENEFICIO": "", "LEGISLACAO": "Convênio ICMS 142/18",
-            "FUNDAMENTO_LEGAL": "Artigos correspondentes ao segmento no Convênio ICMS 142/18",
+            "FUNDAMENTO_LEGAL": "Diretriz Geral do Convênio ICMS 142/18",
             "OBSERVACAO": f"Segmento passível de ST nacionalmente: {seg['DESC']}"
         })
         
@@ -145,7 +145,9 @@ def carregar_base():
             df[col] = ""
     return df[COLUNAS_BASE]
 
-BASE = carregar_base()
+# Inicializa a base no Session State para evitar conflitos de escopo local/global
+if "base_tributaria" not in st.session_state:
+    st.session_state["base_tributaria"] = carregar_base()
 
 # ============================================================ #
 # LEITURA DA NF-E
@@ -212,7 +214,6 @@ def extrair_itens(root):
             "Alíquota ICMS": "", "Valor ICMS": "", "CST PIS": "", "CST COFINS": "", "CST IPI": "",
         }
         
-        # ICMS
         if imposto is not None:
             for el in imposto.iter():
                 nome = tag_final(el)
@@ -229,10 +230,15 @@ def extrair_itens(root):
                 elif nome == "vICMS":
                     item["Valor ICMS"] = texto(el)
                     
-        # PIS / COFINS / IPI
         for el in det.iter():
             tag = tag_final(el)
             if tag in ["PIS", "COFINS", "IPI"]:
                 for filho in el.iter():
                     if tag_final(filho) == "CST":
                         item[f"CST {tag}"] = texto(filho)
+                        break
+        itens.append(item)
+    return itens
+
+# ============================================================ #
+# REGRAS AUTOMÁTICAS DE CONSISTÊNCIA
