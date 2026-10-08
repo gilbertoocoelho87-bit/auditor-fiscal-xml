@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-=====================================================================
- ANALISTA DE XML NF-e — Auditor tributário em lote
-=====================================================================
- 1. Importa NF-e em LOTE (pasta com .xml e/ou .zip)
- 2. Lê cada produto: NCM, CFOP, CST/CSOSN, CEST, ICMS, ICMS-ST, PIS, COFINS
- 3. Confronta com a base tributária (tributacao_db.json):
-    - Monofásico PIS/COFINS (Lei 10.637/2002, Lei 10.833/2003, LC 70/2002,
-      Decreto 13.708/2023)
-    - ICMS-ST por UF (RICMS estaduais, CEST - Convênio ICMS 52/2017, MVA)
- 4. Aponta INCONSISTÊNCIAS, cita a base legal e informa a tributação correta
- 5. Gera relatório CSV (sempre) e XLSX (se openpyxl instalado)
-
-USO:
-  python xml_analyst.py --pasta ./xmls --saida relatorio.xlsx
-"""
 import argparse, csv, json, os, re, sys, zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
