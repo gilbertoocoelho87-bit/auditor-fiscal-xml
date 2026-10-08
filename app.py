@@ -223,7 +223,16 @@ if __name__ == "__main__":
         
         # Exibe no console
         print("\n--- RESUMO DA AUDITORIA FISCAL ---")
-        print(df_resultado[['numero_nota', 'ncm', 'status_auditoria', 'inconsistencias', 'legislacao_aplicavel']])
+       # Colunas desejadas para exibição
+colunas_desejadas = ['numero_nota', 'ncm', 'status_auditoria', 'inconsistencias', 'legislacao_aplicavel']
+
+# Filtra apenas as colunas que realmente existem no DataFrame
+colunas_existentes = [col for col in colunas_desejadas if col in df_resultado.columns]
+
+if not df_resultado.empty and colunas_existentes:
+    print(df_resultado[colunas_existentes])
+else:
+    print("Nenhum dado válido ou XML foi encontrado para auditoria.")
 
         # Salva o resultado detalhado em um arquivo Excel para análise profissional
         caminho_excel = "Relatorio_Auditoria_Fiscal_XML.xlsx"
