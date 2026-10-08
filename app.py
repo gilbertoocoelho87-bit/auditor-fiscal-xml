@@ -235,6 +235,16 @@ else:
     print("Nenhum dado válido ou XML foi encontrado para auditoria.")
 
         # Salva o resultado detalhado em um arquivo Excel para análise profissional
+        # Exibe no console se houver colunas válidas
+        colunas_desejadas = ['numero_nota', 'ncm', 'status_auditoria', 'inconsistencias', 'legislacao_aplicavel']
+        colunas_existentes = [col for col in colunas_desejadas if col in df_resultado.columns]
+        
+        if not df_resultado.empty and colunas_existentes:
+            print(df_resultado[colunas_existentes])
+
+        # Linha 238 corrigida (alinhada exatamente com o mesmo recuo do 'else')
         caminho_excel = "Relatorio_Auditoria_Fiscal_XML.xlsx"
+        df_resultado.to_excel(caminho_excel, index=False)
+        print(f"\nRelatório final gerado com sucesso em: {caminho_excel}")
         df_resultado.to_excel(caminho_excel, index=False)
         print(f"\nRelatório final gerado com sucesso em: {caminho_excel}")
