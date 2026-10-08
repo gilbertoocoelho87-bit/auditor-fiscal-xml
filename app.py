@@ -1,253 +1,433 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+=====================================================================
+ ANALISTA DE XML NF-e — Auditor tributário em lote
+=====================================================================
+ 1. Importa NF-e em LOTE (pasta com .xml e/ou .zip)
+ 2. Lê cada produto: NCM, CFOP, CST/CSOSN, CEST, ICMS, ICMS-ST, PIS, COFINS
+ 3. Confronta com a base tributária (tributacao_db.json):
+    - Monofásico PIS/COFINS (Lei 10.637/2002, Lei 10.833/2003, LC 70/2002,
+      Decreto 13.708/2023)
+    - ICMS-ST por UF (RICMS estaduais, CEST - Convênio ICMS 52/2017, MVA)
+ 4. Aponta INCONSISTÊNCIAS, cita a base legal e informa a tributação correta
+ 5. Gera relatório CSV (sempre) e XLSX (se openpyxl instalado)
+
+USO:
+  python xml_analyst.py --pasta ./xmls --saida relatorio.xlsx
+"""
+import argparse, csv, json, os, re, sys, zipfile
 import xml.etree.ElementTree as ET
-import pandas as pd
-import streamlit as st
-from typing import Dict, List, Any
+from pathlib import Path
 
-st.set_page_config(page_title="Auditor Fiscal Avançado de XMLs", layout="wide")
+NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 
-class AuditarXMLFiscal:
-    """Engine de Auditoria Fiscal de NF-e com regras Federais (EFD-Contribuições 4.3.10) e Estaduais (por UF)."""
-    NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+# ------------------------------------------------------------------ #
+# Auxiliares de leitura do XML
+# ------------------------------------------------------------------ #
+def tx(el, *caminhos):
+    """Retorna o texto do primeiro caminho encontrado."""
+    for c in caminhos:
+        e = el.find(c, NS)
+        if e is not None and e.text:
+            return e.text.strip()
+    return None
 
-    def __init__(self, matriz_tributaria: Dict[str, Any]):
-        self.matriz_tributaria = matriz_tributaria
+def num(el, *caminhos):
+    t = tx(el, *caminhos)
+    try:
+        return float(t.replace(",", ".")) if t is not None else None
+    except ValueError:
+        return None
 
-    def extrair_dados_xml_conteudo(self, conteudo_bytes: bytes, nome_arquivo: str) -> List[Dict[str, Any]]:
-        itens = []
-        try:
-            root = ET.fromstring(conteudo_bytes)
-            
-            if root.tag.endswith('nfeProc'):
-                infNfe = root.find('.//nfe:infNFe', self.NS)
-            elif root.tag.endswith('NFe'):
-                infNfe = root.find('.//nfe:infNFe', self.NS)
-            else:
-                infNfe = root
-                
-            if infNfe is None:
-                return [{'arquivo': nome_arquivo, 'erro_xml': 'Estrutura de XML NFe inválida'}]
-
-            ide = infNfe.find('nfe:ide', self.NS)
-            uf_emit = infNfe.find('.//nfe:emit/nfe:enderEmit/nfe:UF', self.NS)
-            uf_dest = infNfe.find('.//nfe:dest/nfe:enderDest/nfe:UF', self.NS)
-            
-            uf_origem = uf_emit.text if uf_emit is not None else 'SP'
-            uf_destino = uf_dest.text if uf_dest is not None else 'PE'
-            num_nota = ide.find('nfe:nNF', self.NS).text if ide is not None and ide.find('nfe:nNF', self.NS) is not None else 'N/A'
-
-            for det in infNfe.findall('nfe:det', self.NS):
-                num_item = det.attrib.get('nItem', '1')
-                prod = det.find('nfe:prod', self.NS)
-                imposto = det.find('nfe:imposto', self.NS)
-                
-                ncm = prod.find('nfe:NCM', self.NS).text if prod.find('nfe:NCM', self.NS) is not None else ''
-                descricao = prod.find('nfe:xProd', self.NS).text if prod.find('nfe:xProd', self.NS) is not None else ''
-                
-                cst_pis, cst_cofins, cst_icms = '', '', ''
-                
-                if imposto is not None:
-                    # PIS
-                    pis = imposto.find('.//nfe:PIS', self.NS)
-                    if pis is not None and len(pis) > 0:
-                        cst_pis_el = pis[0].find('nfe:CST', self.NS)
-                        cst_pis = cst_pis_el.text if cst_pis_el is not None else ''
-                    
-                    # COFINS
-                    cofins = imposto.find('.//nfe:COFINS', self.NS)
-                    if cofins is not None and len(cofins) > 0:
-                        cst_cofins_el = cofins[0].find('nfe:CST', self.NS)
-                        cst_cofins = cst_cofins_el.text if cst_cofins_el is not None else ''
-                        
-                    # ICMS
-                    icms = imposto.find('.//nfe:ICMS', self.NS)
-                    if icms is not None and len(icms) > 0:
-                        cst_icms_el = icms[0].find('nfe:CST', self.NS)
-                        if cst_icms_el is None:
-                            cst_icms_el = icms[0].find('nfe:CSOSN', self.NS)
-                        cst_icms = cst_icms_el.text if cst_icms_el is not None else ''
-
-                itens.append({
-                    'arquivo': nome_arquivo,
-                    'numero_nota': num_nota,
-                    'uf_origem': uf_origem,
-                    'uf_destino': uf_destino,
-                    'item': num_item,
-                    'descricao': descricao,
-                    'ncm': ncm,
-                    'cst_pis_informado': cst_pis,
-                    'cst_cofins_informado': cst_cofins,
-                    'cst_icms_informado': cst_icms,
-                    'erro_xml': ''
-                })
-
-        except ET.ParseError:
-            return [{'arquivo': nome_arquivo, 'erro_xml': 'Arquivo XML corrompido ou malformado'}]
-        except Exception as e:
-            return [{'arquivo': nome_arquivo, 'erro_xml': f'Erro ao processar: {str(e)}'}]
-            
-        return itens
-
-    def buscar_regra_ncm(self, ncm: str) -> Dict[str, Any]:
-        """Busca a regra pelo NCM exato (8 dígitos) ou pela posição (primeiros 4 dígitos)."""
-        if ncm in self.matriz_tributaria:
-            return self.matriz_tributaria[ncm]
-        
-        # Busca por posição NCM (4 dígitos)
-        posicao_ncm = ncm[:4] if len(ncm) >= 4 else ncm
-        if posicao_ncm in self.matriz_tributaria:
-            return self.matriz_tributaria[posicao_ncm]
-            
+def icms_info(imposto):
+    """Extrai dados do grupo ICMS (independe do CST usado)."""
+    icms = imposto.find("nfe:ICMS", NS)
+    if icms is None or len(icms) == 0:
         return {}
+    g = icms[0]
+    cst = tx(g, "nfe:CST", "nfe:CSOSN")
+    tag = g.tag.split("}")[-1]
+    return {
+        "grupo": tag, "cst": cst,
+        "orig": tx(g, "nfe:orig"),
+        "pICMS": num(g, "nfe:pICMS"),
+        "vBC": num(g, "nfe:vBC"),
+        "vICMS": num(g, "nfe:vICMS"),
+        "pRedBC": num(g, "nfe:pRedBC"),
+        "pRedBCST": num(g, "nfe:pRedBCST"),
+        "vBCST": num(g, "nfe:vBCST"),
+        "pICMSST": num(g, "nfe:pICMSST"),
+        "vICMSST": num(g, "nfe:vICMSST"),
+        "vBCSTRet": num(g, "nfe:vBCSTRet"),
+        "pST": num(g, "nfe:pST"),
+        "vICMSSTRet": num(g, "nfe:vICMSSTRet"),
+        "vICMSSubstituto": num(g, "nfe:vICMSSubstituto"),
+        "vBCFCPST": num(g, "nfe:vBCFCPST"),
+        "pFCPST": num(g, "nfe:pFCPST"),
+        "vFCPST": num(g, "nfe:vFCPST"),
+        "motDesICMS": tx(g, "nfe:motDesICMS"),
+        # Partilha / EC 87-2015 (NF-e 4.00)
+        "vBCUFDest": num(g, "nfe:vBCUFDest"),
+        "pFCPUFDest": num(g, "nfe:pFCPUFDest"),
+        "pICMSUFDest": num(g, "nfe:pICMSUFDest"),
+        "pICMSInter": num(g, "nfe:pICMSInter"),
+        "pICMSInterPart": num(g, "nfe:pICMSInterPart"),
+        "vFCPUFDest": num(g, "nfe:vFCPUFDest"),
+        "vICMSUFDest": num(g, "nfe:vICMSUFDest"),
+        "vICMSUFRemet": num(g, "nfe:vICMSUFRemet"),
+    }
 
-    def auditar_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        if item.get('erro_xml'):
-            item['status_auditoria'] = 'ERRO_XML'
-            item['inconsistencias'] = item['erro_xml']
-            return item
+def pis_cofins(imposto, tag):
+    g = imposto.find(f"nfe:{tag}", NS)
+    if g is None or len(g) == 0:
+        return {"cst": None, "p": None, "v": None}
+    s = g[0]
+    return {"cst": tx(s, "nfe:CST"),
+            "p": num(s, f"nfe:p{tag}"),
+            "v": num(s, f"nfe:v{tag}")}
 
-        ncm = item['ncm']
-        uf_dest = item['uf_destino']
-        inconsistencias = []
+# ------------------------------------------------------------------ #
+# Leitura de um XML (aceita nfeProc ou NFe)
+# ------------------------------------------------------------------ #
+def ler_nfe(xml_bytes, nome_arquivo):
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        return {"arquivo": nome_arquivo, "erro_xml": f"XML inválido: {e}",
+                "emitente": "-", "chave": "-", "numero": "-", "uf_origem": "-",
+                "uf_destino": "-", "produtos": [], "consumidor_final": None}
 
-        regra_ncm = self.buscar_regra_ncm(ncm)
+    inf = root.find(".//nfe:infNFe", NS)
+    chave_tag = inf.get("Id") if inf is not None else None
+    chave = chave_tag.replace("NFe", "") if chave_tag else None
 
-        if not regra_ncm:
-            item['status_auditoria'] = 'NCM_NAO_MAPEADA'
-            item['inconsistencias'] = 'NCM não localizado na base legal de referência.'
-            item['legislacao_aplicavel'] = 'N/A'
-            item['tributacao_correta'] = 'Cadastrar NCM na Matriz Tributária'
-            return item
+    ide = root.find(".//nfe:ide", NS)
+    num_nf = tx(ide, "nfe:nNF") if ide is not None else None
+    serie = tx(ide, "nfe:serie") if ide is not None else None
 
-        # 1. Auditoria PIS/COFINS (Tabela 4.3.10 EFD-Contribuições)
-        cst_pis_esperado = regra_ncm.get('cst_pis_correto', '01')
-        if regra_ncm.get('is_monofasico'):
-            cst_pis_esperado = '04'
-            if item['cst_pis_informado'] != cst_pis_esperado:
-                inconsistencias.append(
-                    f"PIS/COFINS Incorreto: Informado CST {item['cst_pis_informado']}, esperado CST 04 (Monofásico - Tabela 4.3.10 EFD)."
-                )
+    emit = root.find(".//nfe:emit", NS)
+    emitente = tx(emit, "nfe:xNome") if emit is not None else None
+    uf_emit = tx(emit, "nfe:enderEmit/nfe:UF") if emit is not None else None
 
-        # 2. Auditoria ICMS/ST (Estadual por UF de Destino)
-        regras_estaduais = regra_ncm.get('regras_estaduais', {})
-        regra_uf = regras_estaduais.get(uf_dest, regras_estaduais.get('PADRAO', {}))
-        
-        cst_icms_esperado = regra_uf.get('cst_icms_correto', '00')
-        tem_st = regra_uf.get('tem_st', False)
+    dest = root.find(".//nfe:dest", NS)
+    uf_dest = tx(dest, "nfe:enderDest/nfe:UF") if dest is not None else None
+    ind_ie_dest = tx(dest, "nfe:indIEDest") if dest is not None else None
+    cons_final = tx(dest, "nfe:indFinal") if dest is not None else None
 
-        if tem_st and item['cst_icms_informado'] not in ['60', '500', '10', '30', '70']:
-            inconsistencias.append(
-                f"ICMS ST Incorreto em {uf_dest}: Informado {item['cst_icms_informado']}, esperado CST 60/500 ou 10/30/70 (ST Estadual)."
-            )
-        elif not tem_st and item['cst_icms_informado'] in ['60', '500']:
-            inconsistencias.append(
-                f"ICMS Indevido de ST em {uf_dest}: Produto sem ST na UF, informado CST {item['cst_icms_informado']}."
-            )
+    produtos = []
+    for i, det in enumerate(root.findall(".//nfe:det", NS), start=1):
+        prod = det.find("nfe:prod", NS)
+        imp = det.find("nfe:imposto", NS)
+        ipi = imp.find("nfe:IPI", NS) if imp is not None else None
+        produtos.append({
+            "item": i,
+            "codigo": tx(prod, "nfe:cProd") if prod is not None else None,
+            "descricao": tx(prod, "nfe:xProd") if prod is not None else None,
+            "ncm": tx(prod, "nfe:NCM") if prod is not None else None,
+            "cfop": tx(prod, "nfe:CFOP") if prod is not None else None,
+            "cest": tx(prod, "nfe:CEST") if prod is not None else None,
+            "qtd": num(prod, "nfe:qCom") if prod is not None else None,
+            "v_unit": num(prod, "nfe:vUnCom") if prod is not None else None,
+            "ipi_cst": tx(ipi, ".//nfe:CST") if ipi is not None else None,
+            "icms": icms_info(imp) if imp is not None else {},
+            "pis": pis_cofins(imp, "PIS") if imp is not None else {},
+            "cofins": pis_cofins(imp, "COFINS") if imp is not None else {},
+        })
 
-        # Base Legal Compilada
-        leg_fed = regra_ncm.get('base_legal_federal', 'Tabela 4.3.10 EFD-Contribuições')
-        leg_est = regra_uf.get('base_legal_estadual', f'RICMS/{uf_dest}')
-        base_legal_completa = f"Federal: {leg_fed} | Estadual ({uf_dest}): {leg_est}"
+    return {"arquivo": nome_arquivo, "erro_xml": None,
+            "chave": chave, "numero": num_nf, "serie": serie,
+            "emitente": emitente, "uf_origem": uf_emit, "uf_destino": uf_dest,
+            "ind_ie_dest": ind_ie_dest, "consumidor_final": cons_final,
+            "produtos": produtos}
 
-        if inconsistencias:
-            item['status_auditoria'] = 'INCONSISTENTE'
-            item['inconsistencias'] = ' | '.join(inconsistencias)
-            item['legislacao_aplicavel'] = base_legal_completa
-            item['tributacao_correta'] = f"PIS/COFINS CST {cst_pis_esperado} | ICMS CST {cst_icms_esperado}"
-        else:
-            item['status_auditoria'] = 'CONFORME'
-            item['inconsistencias'] = 'Nenhuma'
-            item['legislacao_aplicavel'] = base_legal_completa
-            item['tributacao_correta'] = 'Tributação declarada em conformidade'
+# ------------------------------------------------------------------ #
+# Importação em lote (.xml e .zip, com subpastas)
+# ------------------------------------------------------------------ #
+def importar_lote(pasta):
+    arquivos = []
+    pasta = Path(pasta)
+    if not pasta.exists():
+        print(f"[ERRO] Pasta não encontrada: {pasta}")
+        sys.exit(1)
+    for f in sorted(pasta.rglob("*")):
+        if f.suffix.lower() == ".xml":
+            arquivos.append((str(f), f.read_bytes()))
+        elif f.suffix.lower() == ".zip":
+            with zipfile.ZipFile(f) as z:
+                for n in z.namelist():
+                    if n.lower().endswith(".xml"):
+                        arquivos.append((f"{f.name}/{n}", z.read(n)))
+    print(f"[INFO] {len(arquivos)} arquivo(s) XML encontrados em lote.")
+    return [ler_nfe(b, n) for n, b in arquivos]
 
-        return item
+# ------------------------------------------------------------------ #
+# MOTOR DE REGRAS
+# ------------------------------------------------------------------ #
+def _regra(base, ncm):
+    """Localiza o item da base mais específico para o NCM (8→2 dígitos)."""
+    for tam in (8, 7, 6, 4, 2):
+        p = (ncm or "")[:tam]
+        if p in base:
+            return p, base[p]
+    return None, None
 
+CST_ST_ICMS = {"10", "30", "70", "90", "201", "202", "203", "500", "900"}
+CST_ST_CSOSN = {"201", "202", "203", "500", "900"}
 
-# --- MATRIZ TRIBUTÁRIA EFD-CONTRIBUIÇÕES TABELA 4.3.10 (TODOS OS GRUPOS MONOFÁSICOS) ---
-MATRIZ_TABELA_4_3_10 = {
-    # === GRUPO 1: COMBUSTÍVEIS E LUBRIFICANTES (Lei 9.990/00, Lei 10.336/01) ===
-    '27101159': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 101 - Gasolinas (Lei 9.990/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '27101259': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 101 - Gasolinas (Lei 9.990/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '27101921': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 102 - Óleo Diesel (Lei 9.990/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '27111910': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 103 - GLP / Gás de Cozinha (Lei 9.990/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '27101932': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 104 - Óleos Lubrificantes', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '22071000': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 105 - Álcool Etílico Carburante (Lei 9.718/98)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
+def avaliar_nota(nota, base, achados):
+    def add(regra, sev, item, prod, ncm, problema, correcao, lei):
+        achados.append({
+            "arquivo": nota["arquivo"], "chave": nota.get("chave"),
+            "numero": nota.get("numero"), "serie": nota.get("serie"),
+            "emitente": nota.get("emitente"),
+            "uf_origem": nota.get("uf_origem"), "uf_destino": nota.get("uf_destino"),
+            "regra": regra, "severidade": sev, "item": item,
+            "produto": prod, "ncm": ncm,
+            "problema_identificado": problema,
+            "correcao_recomendada": correcao,
+            "base_legal": lei,
+        })
 
-    # === GRUPO 2: MEDICAMENTOS E PRODUTOS FARMACÊUTICOS (Lei 10.147/00) ===
-    '3001': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 201 - Posição 3001 (Lei 10.147/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '3003': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 201 - Posição 3003 Medicamentos (Lei 10.147/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '3004': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 201 - Posição 3004 Medicamentos em Doses (Lei 10.147/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
+    if nota.get("erro_xml"):
+        add("E-XML", "ERRO", "-", "-", "-", nota["erro_xml"],
+            "Verificar arquivo, estrutura e schema da NF-e.",
+            "Manual de Orientação do Contribuinte - MOC NF-e")
+        return
 
-    # === GRUPO 3: PERFUMARIA, HIGIENE PESSOAL E COSMÉTICOS (Lei 10.147/00) ===
-    '3303': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 202 - Perfumes e Águas de Colônia (Lei 10.147/00)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '3304': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 202 - Produtos de Maquiagem e Cuidados com a Pele', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '3305': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 202 - Preparações Capilares / Xampus', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '3307': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 202 - Desodorantes, Banhos e Barbeação', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '34011190': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 202 - Sabões de Toucador', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
+    for p in nota["produtos"]:
+        ncm, cfop, item = p["ncm"], p["cfop"], p["item"]
+        icms, pis, cofins = p["icms"], p["pis"], p["cofins"]
 
-    # === GRUPO 4: VEÍCULOS, MÁQUINAS E AUTOPEÇAS (Lei 10.485/02) ===
-    '8701': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 301 - Tratores (Lei 10.485/02)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '8702': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 301 - Ônibus e Micro-ônibus', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '8703': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 301 - Automóveis de Passageiros', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '8704': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 301 - Caminhões e Veículos de Carga', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '8708': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 303 - Partes e Acessórios de Automóveis (Autopeças)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '4011': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 302 - Pneus Novos de Borracha', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '4013': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 302 - Câmaras de Ar de Borracha', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
+        # R-01: NCM ausente/mal formado
+        if not ncm or not re.fullmatch(r"\d{8}", ncm):
+            add("R-01", "ERRO", item, p["descricao"], ncm,
+                "NCM ausente ou com formato inválido (deve ter 8 dígitos).",
+                "Informar NCM de 8 dígitos, conforme TIPI.",
+                "Lei 12.865/2013 art. 2º; Decreto 7.660/2011; TIPI")
 
-    # === GRUPO 5: BEBIDAS FRIAS (Lei 13.097/15 - Águas, Refrigerantes, Cervejas, Energéticos) ===
-    '2201': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 401/402 - Águas Minerais e Gaseificadas (Lei 13.097/15)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '2202': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 403 - Refrigerantes, Chás, Energéticos e Refrescos', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '2203': {'is_monofasico': True, 'cst_pis_correto': '04', 'base_legal_federal': 'Tabela 4.3.10 Cód 404 - Cervejas de Malte', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
+        ncm_c, dados = _regra(base, ncm)
 
-    # === OUTROS MATERIAIS DE CONSTRUÇÃO E INSUMOS COMUNS (ST ESTADUAL / TRIBUTAÇÃO NORMAL FEDERAL) ===
-    '25232910': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Cimento)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '39174090': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Tubos/Conexões)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '32091010': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Tintas)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '35061090': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Massa Plástica)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '73170090': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Pregos)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '72142000': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Ferro/Aço)', 'regras_estaduais': {'PADRAO': {'tem_st': True, 'cst_icms_correto': '60'}}},
-    '62101000': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Capa Chuva)', 'regras_estaduais': {'PADRAO': {'tem_st': False, 'cst_icms_correto': '00'}}},
-    '68052000': {'is_monofasico': False, 'cst_pis_correto': '01', 'base_legal_federal': 'Lei 10.833/2003 (Lixas)', 'regras_estaduais': {'PADRAO': {'tem_st': False, 'cst_icms_correto': '00'}}}
+        # R-02: NCM não cadastrado na base
+        if ncm and dados is None:
+            add("R-02", "AVISO", item, p["descricao"], ncm,
+                "NCM não localizado na base tributária. Validação de monofásico "
+                "e ICMS-ST não executada para este item.",
+                "Cadastrar o NCM na tributacao_db.json com base nas tabelas oficiais.",
+                "LC 70/2002; Convênio ICMS 52/2017")
+
+        # R-03: MONOFÁSICO PIS/COFINS
+        if dados and dados.get("monofasico"):
+            mo = dados["monofasico"]
+            lei_mono = mo.get("base_legal",
+                "Lei 10.637/2002 art. 4º; Lei 10.833/2003 art. 5º; LC 70/2002 art. 7º")
+            if pis["cst"] not in (None, mo.get("pis_cst", "04")):
+                add("R-03", "ERRO", item, p["descricao"], ncm,
+                    f"Produto MONOFÁSICO tributado em PIS com CST {pis['cst']} "
+                    f"(alíquota própria); deveria ser CST {mo.get('pis_cst','04')} "
+                    "(operação tributável monofásica - revenda).",
+                    f"Usar PIS CST {mo.get('pis_cst','04')} com vBC=0, pPIS=0 e vPIS=0.",
+                    lei_mono)
+            if cofins["cst"] not in (None, mo.get("cofins_cst", "04")):
+                add("R-03", "ERRO", item, p["descricao"], ncm,
+                    f"Produto MONOFÁSICO tributado em COFINS com CST {cofins['cst']}; "
+                    f"deveria ser CST {mo.get('cofins_cst','04')}.",
+                    f"Usar COFINS CST {mo.get('cofins_cst','04')} com vBC=0, pCOFINS=0, vCOFINS=0.",
+                    lei_mono)
+
+        uf_dest = nota.get("uf_destino") or nota.get("uf_origem")
+        st = dados.get("icms_st") if dados else None
+        cest_oficial = st.get("cest") if st else None
+
+        # R-04: CEST divergente
+        if st and cest_oficial and p["cest"] and p["cest"] != cest_oficial:
+            add("R-04", "ERRO", item, p["descricao"], ncm,
+                f"CEST divergente: XML informa {p['cest']}; tabela oficial "
+                f"(Convênio ICMS 52/2017) prevê {cest_oficial}.",
+                f"Ajustar o CEST para {cest_oficial}.",
+                "Convênio ICMS 52/2017 (Anexos); LC 87/1996 art. 8º, X")
+
+        # R-05: ST obrigatória na operação interna e não destacada
+        if st and uf_dest in st.get("uf", {}):
+            regra_uf = st["uf"][uf_dest]
+            cfop_interno = cfop and cfop.startswith("5")
+            tem_st = icms.get("vICMSST") and icms["vICMSST"] > 0
+            if cfop_interno and not tem_st and icms.get("cst") not in CST_ST_ICMS:
+                add("R-05", "ERRO", item, p["descricao"], ncm,
+                    f"Produto SUJEITO a ICMS-ST na UF destino ({uf_dest}) e a NF-e "
+                    f"não destacou ICMS retido (CST {icms.get('cst')}).",
+                    f"Destacar ICMS-ST: CST 10/70/90 (ou CSOSN 201-203), "
+                    f"CEST {cest_oficial or ''}, MVA ajustada conforme RICMS/{uf_dest}.",
+                    f"{regra_uf.get('base_legal', 'RICMS da UF de destino')}; LC 87/1996 art. 8º-13")
+            if cfop_interno and tem_st and not p["cest"]:
+                add("R-05", "ERRO", item, p["descricao"], ncm,
+                    "ICMS-ST destacado sem informação do CEST.",
+                    f"Informar CEST {cest_oficial} no item do produto.",
+                    "Convênio ICMS 52/2017; LC 87/1996 art. 8º, X")
+            # R-05A: alíquota do ICMS-ST vs alíquota interna da UF
+            if cfop_interno and tem_st and regra_uf.get("aliquota_interna"):
+                p_st = icms.get("pICMSST")
+                ali_interna = regra_uf["aliquota_interna"]
+                if p_st is not None and abs(p_st - ali_interna) > 0.5:
+                    add("R-05A", "ERRO", item, p["descricao"], ncm,
+                        f"Alíquota do ICMS-ST divergente: XML={p_st}%; interna da "
+                        f"{uf_dest}={ali_interna}%.",
+                        f"Usar {ali_interna}% sobre BC com MVA ajustada.",
+                        regra_uf.get("base_legal", f"RICMS/{uf_dest}"))
+
+        # R-06: CFOP 6.x p/ consumidor final sem ICMS retido nem partilha (EC 87/2015)
+        cfop_inter = cfop and cfop.startswith("6")
+        if (cfop_inter and nota.get("consumidor_final") == "1"
+                and nota.get("ind_ie_dest") == "9"
+                and nota.get("uf_origem") != nota.get("uf_destino")):
+            sem_ret = not icms.get("vICMSSTRet")
+            sem_part = not icms.get("vICMSUFDest")
+            if sem_ret and sem_part:
+                add("R-06", "ERRO", item, p["descricao"], ncm,
+                    "Venda INTERESTADUAL a consumidor final NÃO contribuinte sem "
+                    "ICMS-ST retido nem partilha do ICMS (difal).",
+                    "Se o produto for ST na UF destino: destacar vBCSTRet, pST e "
+                    "vICMSSTRet. Caso contrário: recolher partilha (pICMSInterPart "
+                    "conforme tabela de transição 2016-2018, atualmente 100% UF destino).",
+                    "EC 87/2015; ADCT da CF art. 101; LC 190/2016")
+
+        # R-07: CFOP de ST (5.4xx/6.4xx) sem ICMS retido
+        if cfop and cfop[1] == "4" and cfop[0] in "56":
+            if not (icms.get("vICMSSTRet") and icms["vICMSSTRet"] > 0):
+                add("R-07", "ERRO", item, p["descricao"], ncm,
+                    f"CFOP {cfop} (subtrair ICMS retido por substituição) sem valor "
+                    "de ICMS retido no item.",
+                    "Informar vBCSTRet, pST e vICMSSTRet ou corrigir o CFOP.",
+                    "LC 87/1996 art. 8º, §5º; Ajuste SINIEF 5/2004")
+
+        # R-08: CSOSN Simples Nacional com ST e sem CEST
+        if icms.get("grupo", "").startswith("ICMSSN") \
+                and icms.get("cst") in CST_ST_CSOSN and not p["cest"]:
+            add("R-08", "ERRO", item, p["descricao"], ncm,
+                f"CSOSN {icms['cst']} (ICMS-ST devido pelo Simples) sem CEST.",
+                "Informar o CEST conforme tabela do Convênio ICMS 52/2017.",
+                "Convênio ICMS 52/2017; LC 123/2006 art. 25")
+
+        # R-09: CSOSN 201-203 sem pICMS
+        if icms.get("cst") in {"201", "202", "203"} and icms.get("pICMS") in (None, 0.0):
+            add("R-09", "AVISO", item, p["descricao"], ncm,
+                "CSOSN 201-203 exige alíquota do ICMS próprio do Simples Nacional.",
+                "Informar pICMS conforme tabela do Simples no RICMS da UF.",
+                f"RICMS/{nota.get('uf_origem')} (Simples Nacional)")
+
+# ------------------------------------------------------------------ #
+# Relatórios
+# ------------------------------------------------------------------ #
+CAMPOS = ["arquivo", "chave", "numero", "serie", "emitente", "uf_origem",
+          "uf_destino", "regra", "severidade", "item", "produto", "ncm",
+          "problema_identificado", "correcao_recomendada", "base_legal"]
+
+def exportar(achados, notas, saida):
+    saida = Path(saida)
+    with open(saida.with_suffix(".csv"), "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=CAMPOS, delimiter=";")
+        w.writeheader()
+        for a in achados:
+            w.writerow({k: a.get(k) for k in CAMPOS})
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Inconsistências"
+        ws.append(CAMPOS)
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1F4E78")
+        for a in achados:
+            ws.append([a.get(k) for k in CAMPOS])
+        ws.auto_filter.ref = ws.dimensions
+
+        ws2 = wb.create_sheet("Resumo por Nota")
+        ws2.append(["arquivo", "chave", "numero", "emitente", "uf_origem",
+                    "uf_destino", "itens", "erros", "avisos", "status"])
+        for c in ws2[1]:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1F4E78")
+        por_nota = {}
+        for a in achados:
+            d = por_nota.setdefault(a["arquivo"], {"erros": 0, "avisos": 0})
+            d["erros" if a["severidade"] == "ERRO" else "avisos"] += 1
+        for n in notas:
+            st = por_nota.get(n["arquivo"], {"erros": 0, "avisos": 0})
+            status = "REPROVADO" if st["erros"] else ("ATENÇÃO" if st["avisos"] else "OK")
+            ws2.append([n["arquivo"], n.get("chave"), n.get("numero"),
+                        n.get("emitente"), n.get("uf_origem"), n.get("uf_destino"),
+                        len(n["produtos"]), st["erros"], st["avisos"], status])
+        wb.save(saida.with_suffix(".xlsx"))
+        print(f"[OK] Relatório XLSX: {saida.with_suffix('.xlsx')}")
+    except ImportError:
+        print("[AVISO] openpyxl não instalado - gerado apenas CSV.")
+    print(f"[OK] Relatório CSV : {saida.with_suffix('.csv')}")
+
+# ------------------------------------------------------------------ #
+def main():
+    ap = argparse.ArgumentParser(description="Analista tributário de NF-e em lote")
+    ap.add_argument("--pasta", required=True, help="Pasta com XMLs e/ou ZIPs")
+    ap.add_argument("--base", default="tributacao_db.json",
+                    help="Base tributária JSON (monofásico + ST por UF)")
+    ap.add_argument("--saida", default="relatorio_auditoria", help="Arquivo de saída")
+    args = ap.parse_args()
+
+    with open(args.base, encoding="utf-8") as f:
+        base = json.load(f)
+
+    notas = importar_lote(args.pasta)
+    achados = []
+    for n in notas:
+        avaliar_nota(n, base, achados)
+
+    erros = sum(1 for a in achados if a["severidade"] == "ERRO")
+    print(f"\n[INFO] Notas: {len(notas)} | Achados: {len(achados)} "
+          f"(ERRO: {erros}, AVISO: {len(achados)-erros})")
+    exportar(achados, notas, args.saida)
+
+if __name__ == "__main__":
+    main()
+    {
+  "2203": {
+    "descricao": "Cervejas, chopes e bebidas fermentadas",
+    "monofasico": {
+      "pis_cst": "04", "cofins_cst": "04",
+      "base_legal": "Lei 10.637/2002 art. 4º; Lei 10.833/2003 art. 5º; LC 70/2002 art. 7º (lista III); Decreto 13.708/2023"
+    },
+    "icms_st": {
+      "cest": "0300100",
+      "uf": {
+        "SP": {"mva": 72.0, "aliquota_interna": 18.0, "base_legal": "RICMS/SP art. 313-B e Anexo V"},
+        "RJ": {"mva": 70.0, "aliquota_interna": 22.0, "base_legal": "RICMS/RJ Anexo XIII"}
+      }
+    }
+  },
+  "4011": {
+    "descricao": "Pneus novos de borracha",
+    "icms_st": {
+      "cest": "0600100",
+      "uf": {
+        "SP": {"mva": 55.0, "aliquota_interna": 18.0, "base_legal": "RICMS/SP art. 313-E"}
+      }
+    }
+  },
+  "30049059": {
+    "descricao": "Medicamentos (outros)",
+    "icms_st": {
+      "cest": "1300500",
+      "uf": {
+        "SP": {"mva": 38.0, "aliquota_interna": 18.0, "base_legal": "RICMS/SP art. 313-K"}
+      }
+    }
+  },
+  "22021000": {
+    "descricao": "Águas minerais (inclusive adicionadas de açúcar)",
+    "monofasico": {
+      "pis_cst": "04", "cofins_cst": "04",
+      "base_legal": "Lei 10.637/2002 art. 4º; Lei 10.833/2003 art. 5º; LC 70/2002 art. 7º; Decreto 13.708/2023"
+    }
+  }
 }
-
-# --- INTERFACE STREAMLIT ---
-st.title("📊 Auditor Fiscal XML - Tabela 4.3.10 EFD-Contribuições + ST Estadual")
-
-st.markdown("""
-Esta versão inclui o mapeamento da **Tabela 4.3.10 da EFD-Contribuições (SPED)** para PIS/COFINS Monofásico (CST 04):
-- **Combustíveis e Lubrificantes** (Gasolina, Diesel, GLP, Etanol)
-- **Medicamentos e Fármacos** (Posições 3001, 3003, 3004)
-- **Perfumaria e Cosméticos** (Posições 3303, 3304, 3305, 3307, Sabões)
-- **Autopeças, Veículos e Pneus** (Posições 8701 a 8708, 4011, 4013)
-- **Bebidas Frias** (Posições 2201, 2202, 2203 - Águas, Refrigerantes, Cervejas)
-""")
-
-arquivos_carregados = st.file_uploader("Selecione os arquivos XML para auditoria em lote", type=["xml"], accept_multiple_files=True)
-
-if arquivos_carregados:
-    auditor = AuditarXMLFiscal(matriz_tributaria=MATRIZ_TABELA_4_3_10)
-    resultado_final = []
-
-    for arq in arquivos_carregados:
-        conteudo = arq.read()
-        itens = auditor.extrair_dados_xml_conteudo(conteudo, arq.name)
-        for item in itens:
-            resultado_final.append(auditor.auditar_item(item))
-
-    df_resultado = pd.DataFrame(resultado_final)
-
-    st.subheader("Resultados da Auditoria Tributária")
-    st.dataframe(df_resultado, use_container_width=True)
-
-    # Botão para Download do Relatório em Excel
-    excel_bytes = pd.ExcelWriter("relatorio_auditoria_efd.xlsx", engine="openpyxl")
-    df_resultado.to_excel(excel_bytes, index=False)
-    excel_bytes.close()
-
-    with open("relatorio_auditoria_efd.xlsx", "rb") as f:
-        st.download_button(
-            label="📥 Baixar Relatório em Excel",
-            data=f.read(),
-            file_name="Relatorio_Auditoria_Monofasicos_EFD.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
