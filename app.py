@@ -177,7 +177,52 @@ def avaliar_nota(nota, base, achados):
             "Manual de Orientação do Contribuinte - MOC NF-e")
         return
 
-    for p in nota["produtos"]:
+           # R-02: NCM não cadastrado na base mudado/ajustado
+        if ncm and dados is None:
+            add("R-02", "AVISO", item, p["descricao"], ncm,
+                "NCM não localizado na base tributária de referência.",
+                "Verificar se o NCM está ativo na TIPI ou se há erro de digitação.",
+                "Tabela de Incidência do Imposto sobre Produtos Industrializados - TIPI")
+
+        # Continuação do Motor de Regras (Exemplo de validação de CST/CFOP)
+        if dados:
+            # R-03: Exemplo de checagem de alíquota / ST
+            cst_icms = icms.get("cst")
+            if cfop in ["5405", "6405"] and cst_icms not in CST_ST_ICMS:
+                add("R-03", "ERRO", item, p["descricao"], ncm,
+                    f"CFOP {cfop} exige CST de Substituição Tributária, mas foi informado CST {cst_icms}.",
+                    "Corrigir o CST do ICMS para um grupo compatível com ST (ex: 60 ou 500).",
+                    "Art. 5º do Convênio ICMS 92/2015 / Ajuste SINIEF 07/2005")
+
+# ------------------------------------------------------------------ #
+# Geração de Relatórios e Execução Principal
+# ------------------------------------------------------------------ #
+def exportar_csv(achados, caminho_saida):
+    if not achados:
+        print("[INFO] Nenhum problema identificado nas notas avaliadas.")
+        return
+    
+    campos = ["arquivo", "chave", "numero", "serie", "emitente", "uf_origem", 
+              "uf_destino", "regra", "severidade", "item", "produto", "ncm", 
+              "problema_identificado", "correcao_recomendada", "base_legal"]
+    
+    with open(caminho_saida, mode="w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=campos, delimiter=";")
+        writer.writeheader()
+        for linha in achados:
+            writer.writerow(linha)
+    print(f"[INFO] Relatório exportado com sucesso em: {caminho_saida}")
+
+if __name__ == "__main__":
+    # Exemplo de inicialização para testes manuais
+    # base_exemplo = {"01010101": {"aliquota": 0.18}}
+    # notas = importar_lote("./xmls")
+    # alertas = []
+    # for n in notas:
+    #     avaliar_nota(n, base_exemplo, alertas)
+    # exportar_csv(alertas, "relatorio_auditoria.csv")
+    pass
+
         ncm, cfop, item = p["ncm"], p["cfop"], p["item"]
         icms, pis, cofins = p["icms"], p["pis"], p["cofins"]
 
