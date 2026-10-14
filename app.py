@@ -222,10 +222,7 @@ if __name__ == "__main__":
     #     avaliar_nota(n, base_exemplo, alertas)
     # exportar_csv(alertas, "relatorio_auditoria.csv")
     pass
-
-        ncm, cfop, item = p["ncm"], p["cfop"], p["item"]
         icms, pis, cofins = p["icms"], p["pis"], p["cofins"]
-
         # R-01: NCM ausente/mal formado
         if not ncm or not re.fullmatch(r"\d{8}", ncm):
             add("R-01", "ERRO", item, p["descricao"], ncm,
