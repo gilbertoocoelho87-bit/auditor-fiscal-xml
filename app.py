@@ -1,244 +1,190 @@
-import argparse
-import csv
-import json
-import os
-import re
-import sys
-import zipfile
-import xml.etree.ElementTree as ET
-from pathlib import Path
 import streamlit as st
 import pandas as pd
+import xml.etree.ElementTree as ET
+import io
 
-# Configuração da página do Streamlit (deve ser a primeira chamada Streamlit)
-st.set_page_config(page_title="Auditor Fiscal XML", layout="wide")
+# Configuração da página do Streamlit
+st.set_page_config(page_title="Auditor Fiscal Digital - XML & NCM", layout="wide", page_icon="📊")
 
-NS = {"nfe": "http://portalfiscal.inf.br"}
-
-# ------------------------------------------------------------------ #
-# Auxiliares de leitura do XML
-# ------------------------------------------------------------------ #
-def tx(el, *caminhos):
-    """Retorna o texto do primeiro caminho encontrado."""
-    for c in caminhos:
-        e = el.find(c, NS)
-        if e is not None and e.text:
-            return e.text.strip()
-    return None
-
-def num(el, *caminhos):
-    t = tx(el, *caminhos)
-    try:
-        return float(t.replace(",", ".")) if t is not None else None
-    except ValueError:
-        return None
-
-def icms_info(imposto):
-    """Extrai dados do grupo ICMS (independe do CST usado)."""
-    icms = imposto.find("nfe:ICMS", NS)
-    if icms is None or len(icms) == 0:
-        return {}
-    g = icms[0]
-    cst = tx(g, "nfe:CST", "nfe:CSOSN")
-    tag = g.tag.split("}")[-1]
+# --- SIMULAÇÃO DE BANCO DE DADOS (Substitua por tabelas reais/banco de dados) ---
+# Tabelas 4.3.10 e 4.3.11 do SPED (PIS/COFINS Monofásicos)
+@st.cache_data
+def carregar_dados_monofasicos():
+    # Exemplo de NCMs monofásicos (Combustíveis, Bebidas, Autopeças, Medicamentos, etc.)
     return {
-        "grupo": tag, "cst": cst,
-        "orig": tx(g, "nfe:orig"),
-        "pICMS": num(g, "nfe:pICMS"),
-        "vBC": num(g, "nfe:vBC"),
-        "vICMS": num(g, "nfe:vICMS"),
-        "pRedBC": num(g, "nfe:pRedBC"),
-        "pRedBCST": num(g, "nfe:pRedBCST"),
-        "vBCST": num(g, "nfe:vBCST"),
-        "pICMSST": num(g, "nfe:pICMSST"),
-        "vICMSST": num(g, "nfe:vICMSST"),
-        "vBCSTRet": num(g, "nfe:vBCSTRet"),
-        "pST": num(g, "nfe:pST"),
-        "vICMSSTRet": num(g, "nfe:vICMSSTRet"),
-        "vICMSSubstituto": num(g, "nfe:vICMSSubstituto"),
-        "vBCFCPST": num(g, "nfe:vBCFCPST"),
-        "pFCPST": num(g, "nfe:pFCPST"),
-        "vFCPST": num(g, "nfe:vFCPST"),
-        "motDesICMS": tx(g, "nfe:motDesICMS"),
-        # Partilha / EC 87-2015 (NF-e 4.00)
-        "vBCUFDest": num(g, "nfe:vBCUFDest"),
-        "pFCPUFDest": num(g, "nfe:pFCPUFDest"),
-        "pICMSUFDest": num(g, "nfe:pICMSUFDest"),
-        "pICMSInter": num(g, "nfe:pICMSInter"),
-        "pICMSInterPart": num(g, "nfe:pICMSInterPart"),
-        "vFCPUFDest": num(g, "nfe:vFCPUFDest"),
-        "vICMSUFDest": num(g, "nfe:vICMSUFDest"),
-        "vICMSUFRemet": num(g, "nfe:vICMSUFRemet"),
+        "30041010": {"CST_PIS_CORRETO": "02", "CST_COFINS_CORRETO": "02", "Desc": "Medicamentos - Tabela 4.3.10"},
+        "22030000": {"CST_PIS_CORRETO": "02", "CST_COFINS_CORRETO": "02", "Desc": "Cervejas - Tabela 4.3.11"},
+        "40111000": {"CST_PIS_CORRETO": "04", "CST_COFINS_CORRETO": "04", "Desc": "Pneumáticos - Tabela 4.3.10"},
+        "27101259": {"CST_PIS_CORRETO": "04", "CST_COFINS_CORRETO": "04", "Desc": "Gasolina - Tabela 4.3.10"}
     }
 
-def pis_cofins(imposto, tag):
-    g = imposto.find(f"nfe:{tag}", NS)
-    if g is None or len(g) == 0:
-        return {"cst": None, "p": None, "v": None}
-    s = g[0]
-    return {"cst": tx(s, "nfe:CST"),
-            "p": num(s, f"nfe:p{tag}"),
-            "v": num(s, f"nfe:v{tag}")}
+# Legislações de Substituição Tributária por NCM e UF
+@st.cache_data
+def carregar_legislacao_st():
+    # Simulação de base de dados de ST por Estado e NCM
+    return pd.DataFrame([
+        {"NCM": "22030000", "UF": "SP", "ST_Aplicavel": "Sim", "MVA_Original": "70%", "Base_Legal": "Artigo 313-A do RICMS/SP"},
+        {"NCM": "22030000", "UF": "RJ", "ST_Aplicavel": "Sim", "MVA_Original": "65%", "Base_Legal": "Decreto nº 44.444/RJ"},
+        {"NCM": "30041010", "UF": "MG", "ST_Aplicavel": "Sim", "MVA_Original": "35%", "Base_Legal": "Anexo XV do RICMS/MG"},
+        {"NCM": "40111000", "UF": "PR", "ST_Aplicavel": "Sim", "MVA_Original": "45%", "Base_Legal": "Artigo 120 do RICMS/PR"}
+    ])
 
-# ------------------------------------------------------------------ #
-# Leitura de um XML (aceita nfeProc ou NFe)
-# ------------------------------------------------------------------ #
-def ler_nfe(xml_bytes, nome_arquivo):
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError as e:
-        return {"arquivo": nome_arquivo, "erro_xml": f"XML inválido: {e}",
-                "emitente": "-", "chave": "-", "numero": "-", "uf_origem": "-",
-                "uf_destino": "-", "produtos": [], "consumidor_final": None}
-
-    inf = root.find(".//nfe:infNFe", NS)
-    chave_tag = inf.get("Id") if inf is not None else None
-    chave = chave_tag.replace("NFe", "") if chave_tag else None
-
-    ide = root.find(".//nfe:ide", NS)
-    num_nf = tx(ide, "nfe:nNF") if ide is not None else None
-    serie = tx(ide, "nfe:serie") if ide is not None else None
-
-    emit = root.find(".//nfe:emit", NS)
-    emitente = tx(emit, "nfe:xNome") if emit is not None else None
-    uf_emit = tx(emit, "nfe:enderEmit/nfe:UF") if emit is not None else None
-
-    dest = root.find(".//nfe:dest", NS)
-    uf_dest = tx(dest, "nfe:enderDest/nfe:UF") if dest is not None else None
-    ind_ie_dest = tx(dest, "nfe:indIEDest") if dest is not None else None
-    cons_final = tx(dest, "nfe:indFinal") if dest is not None else None
-
-    produtos = []
-    for i, det in enumerate(root.findall(".//nfe:det", NS), start=1):
-        prod = det.find("nfe:prod", NS)
-        imp = det.find("nfe:imposto", NS)
-        ipi = imp.find("nfe:IPI", NS) if imp is not None else None
-        produtos.append({
-            "item": i,
-            "codigo": tx(prod, "nfe:cProd") if prod is not None else None,
-            "descricao": tx(prod, "nfe:xProd") if prod is not None else None,
-            "ncm": tx(prod, "nfe:NCM") if prod is not None else None,
-            "cfop": tx(prod, "nfe:CFOP") if prod is not None else None,
-            "cest": tx(prod, "nfe:CEST") if prod is not None else None,
-            "qtd": num(prod, "nfe:qCom") if prod is not None else None,
-            "v_unit": num(prod, "nfe:vUnCom") if prod is not None else None,
-            "ipi_cst": tx(ipi, ".//nfe:CST") if ipi is not None else None,
-            "icms": icms_info(imp) if imp is not None else {},
-            "pis": pis_cofins(imp, "PIS") if imp is not None else {},
-            "cofins": pis_cofins(imp, "COFINS") if imp is not None else {},
-        })
-
-    return {"arquivo": nome_arquivo, "erro_xml": None,
-            "chave": chave, "numero": num_nf, "serie": serie,
-            "emitente": emitente, "uf_origem": uf_emit, "uf_destino": uf_dest,
-            "ind_ie_dest": ind_ie_dest, "consumidor_final": cons_final,
-            "produtos": produtos}
-
-# ------------------------------------------------------------------ #
-# MOTOR DE REGRAS
-# ------------------------------------------------------------------ #
-def _regra(base, ncm):
-    """Localiza o item da base mais específico para o NCM (8→2 dígitos)."""
-    for tam in (8, 7, 6, 4, 2):
-        p = (ncm or "")[:tam]
-        if p in base:
-            return p, base[p]
-    return None, None
-
-CST_ST_ICMS = {"10", "30", "70", "90", "201", "202", "203", "500", "900"}
-CST_ST_CSOSN = {"201", "202", "203", "500", "900"}
-
-def avaliar_nota(nota, base, achados):
-    def add(regra, sev, item, prod, ncm, problema, correcao, lei):
-        achados.append({
-            "arquivo": nota["arquivo"], "chave": nota.get("chave"),
-            "numero": nota.get("numero"), "serie": nota.get("serie"),
-            "emitente": nota.get("emitente"),
-            "uf_origem": nota.get("uf_origem"), "uf_destino": nota.get("uf_destino"),
-            "regra": regra, "severidade": sev, "item": item,
-            "produto": prod, "ncm": ncm,
-            "problema_identificado": problema,
-            "correcao_recomendada": correcao,
-            "base_legal": lei,
-        })
-
-    if nota.get("erro_xml"):
-        add("E-XML", "ERRO", "-", "-", "-", nota["erro_xml"],
-            "Verificar arquivo, estrutura e schema da NF-e.",
-            "Manual de Orientação do Contribuinte - MOC NF-e")
-        return
-
-    for p in nota["produtos"]:
-        ncm, cfop, item = p["ncm"], p["cfop"], p["item"]
-        icms, pis, cofins = p["icms"], p["pis"], p["cofins"]
-
-        # R-01: NCM ausente/mal formado
-        if not ncm or not re.fullmatch(r"\d{8}", ncm):
-            add("R-01", "ERRO", item, p["descricao"], ncm,
-                "NCM ausente ou com formato inválido (deve ter 8 dígitos).",
-                "Informar NCM de 8 dígitos, conforme TIPI.",
-                "Lei 12.865/2013 art. 2º; Decreto 7.660/2011; TIPI")
-
-        ncm_c, dados = _regra(base, ncm)
-
-        # R-02: NCM não cadastrado na base
-        if ncm and dados is None:
-            add("R-02", "AVISO", item, p["descricao"], ncm,
-                "NCM não localizado na base tributária de referência.",
-                "Verificar se o NCM está ativo na TIPI ou se há erro de digitação.",
-                "Tabela de Incidência do Imposto sobre Produtos Industrializados - TIPI")
-
-# ------------------------------------------------------------------ #
-# INTERFACE EM STREAMLIT
-# ------------------------------------------------------------------ #
-st.title("📊 Auditor Fiscal de XMLs da NF-e")
-st.markdown("Faça o upload de arquivos `.xml` ou arquivos compactados `.zip` para auditar inconsistências fiscais de NCM, CST e CFOP.")
-
-# Base de simulação temporária (Substitua ou integre com seu banco futuramente)
-base_tributaria_exemplo = {
-    "61091000": {"aliquota": 0.18},
-    "62043200": {"aliquota": 0.18}
-}
-
-arquivos_carregados = st.file_uploader(
-    "Arraste ou selecione os arquivos XML / ZIP aqui", 
-    type=["xml", "zip"], 
-    accept_multiple_files=True
-)
-
-if arquivos_carregados:
-    lista_arquivos_processar = []
+# --- FUNÇÃO DE ANÁLISE DOS XMLs ---
+def analisar_xmls(arquivos_xml, db_monofasico):
+    resultados = []
     
-    for arquivo in arquivos_carregados:
-        nome = arquivo.name
-        conteudo = arquivo.read()
-        
-        if nome.lower().endswith(".xml"):
-            lista_arquivos_processar.append((nome, conteudo))
-        elif nome.lower().endswith(".zip"):
-            try:
-                import io
-                with zipfile.ZipFile(io.BytesIO(conteudo)) as z:
-                    for n in z.namelist():
-                        if n.lower().endswith(".xml"):
-                            lista_arquivos_processar.append((f"{nome}/{n}", z.read(n)))
-            except Exception as e:
-                st.error(f"Erro ao descompactar o arquivo ZIP '{nome}': {e}")
+    for arquivo in arquivos_xml:
+        try:
+            # Ler conteúdo do XML carregado na memória
+            conteudo = arquivo.read()
+            root = ET.fromstring(conteudo)
+            
+            # Namespace padrão da NF-e
+            ns = {'nfe': 'http://portalfiscal.inf.br'}
+            
+            # Identificação da Nota e UF do Emitente
+            ide = root.find('.//nfe:ide', ns)
+            emit = root.find('.//nfe:emit', ns)
+            
+            chNFe = root.find('.//nfe:infNFe', ns).attrib.get('Id', 'Desconhecido')[3:] if root.find('.//nfe:infNFe', ns) is not None else "Sem Chave"
+            uf_emit = emit.find('nfe:enderEmit/nfe:UF', ns).text if emit is not None else "XX"
+            
+            # Percorrer produtos da nota
+            for det in root.findall('.//nfe:det', ns):
+                num_item = det.attrib.get('nItem')
+                prod = det.find('nfe:prod', ns)
+                imposto = det.find('nfe:imposto', ns)
+                
+                xProd = prod.find('nfe:xProd', ns).text
+                ncm = prod.find('nfe:NCM', ns).text
+                
+                # Buscar tags de PIS / COFINS no XML
+                pis = imposto.find('.//nfe:PIS', ns)
+                cofins = imposto.find('.//nfe:COFINS', ns)
+                
+                cst_pis_atual = "N/A"
+                cst_cofins_atual = "N/A"
+                
+                # Tenta capturar o CST de PIS enviado
+                if pis is not None:
+                    for child in pis:
+                        cst_node = child.find('nfe:CST', ns)
+                        if cst_node is not None: cst_pis_atual = cst_node.text
+                
+                # Tenta capturar o CST de COFINS enviado
+                if cofins is not None:
+                    for child in cofins:
+                        cst_node = child.find('nfe:CST', ns)
+                        if cst_node is not None: cst_cofins_atual = cst_node.text
+                
+                # --- VALIDAÇÃO MONOFÁSICA ---
+                erro_encontrado = False
+                motivo_erro = ""
+                cst_pis_correto = cst_pis_atual
+                cst_cofins_correto = cst_cofins_atual
+                base_legal_sped = ""
+                
+                if ncm in db_monofasico:
+                    cst_pis_correto = db_monofasico[ncm]["CST_PIS_CORRETO"]
+                    cst_cofins_correto = db_monofasico[ncm]["CST_COFINS_CORRETO"]
+                    base_legal_sped = db_monofasico[ncm]["Desc"]
+                    
+                    if cst_pis_atual != cst_pis_correto or cst_cofins_atual != cst_cofins_correto:
+                        erro_encontrado = True
+                        motivo_erro = f"NCM Monofásico. CST enviado ({cst_pis_atual}/{cst_cofins_atual}) diverge do correto."
+                
+                resultados.append({
+                    "Chave NF-e": chNFe,
+                    "Item": num_item,
+                    "Produto": xProd,
+                    "NCM": ncm,
+                    "UF Origem": uf_emit,
+                    "CST PIS Emitido": cst_pis_atual,
+                    "CST PIS Correto": cst_pis_correto,
+                    "CST COFINS Emitido": cst_cofins_atual,
+                    "CST COFINS Correto": cst_cofins_correto,
+                    "Possui Erro?": "⚠️ Sim" if erro_encontrado else "✅ Não",
+                    "Diagnóstico / Legislação": motivo_erro if erro_encontrado else base_legal_sped
+                })
+                
+        except Exception as e:
+            st.error(f"Erro ao processar o arquivo {arquivo.name}: {e}")
+            
+    return pd.DataFrame(resultados)
 
-    st.info(f"🔍 {len(lista_arquivos_processar)} arquivo(s) XML carregados para análise.")
+# --- REGRAS DO FRONT-END (STREAMLIT) ---
+
+st.title("🏛️ Plataforma Fiscal Inteligente: XML, ST & Monofásico")
+st.markdown("Análise inteligente de arquivos fiscais, validação de regimes monofásicos (SPED) e consulta de regras de Substituição Tributária.")
+
+# Inicializar bases
+db_monofasico = carregar_dados_monofasicos()
+df_st = carregar_legislacao_st()
+
+# Criar abas no site
+aba1, aba2, aba3 = st.tabs(["🔍 Analisador de XML em Lote", "📚 Consulta de Legislação ST", "📋 Tabelas Monofásicas (SPED)"])
+
+# --- ABA 1: ANALISADOR EM LOTE ---
+with aba1:
+    st.header("Análise de XML em Lote (NF-e)")
+    st.write("Faça o upload de um ou mais arquivos XML de Notas Fiscais para identificar erros de emissão baseados nas tabelas 4.3.10 e 4.3.11 do SPED.")
     
-    if st.button("▶️ Executar Auditoria Fiscal"):
-        alertas = []
+    arquivos_carregados = st.file_uploader("Selecione os arquivos XML", type=["xml"], accept_multiple_files=True)
+    
+    if arquivos_carregados:
+        st.success(f"{len(arquivos_carregados)} arquivos carregados com sucesso!")
+        if st.button("Executar Auditoria Fiscal"):
+            with st.spinner("Analisando tags e cruzando com as legislações vigentes..."):
+                df_resultado = analisar_xmls(arquivos_carregados, db_monofasico)
+                
+                # Exibir métricas rápidas
+                total_erros = df_resultado[df_resultado["Possui Erro?"] == "⚠️ Sim"].shape[0]
+                st.metric(label="Inconsistências Fiscais Encontradas", value=total_erros, delta=f"{total_erros} erros detectados", delta_color="inverse")
+                
+                # Mostrar tabela com os dados
+                st.dataframe(df_resultado, use_container_width=True)
+                
+                # Permitir download do relatório em Excel / CSV
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df_resultado.to_excel(writer, index=False, sheet_name='Auditoria_XML')
+                processed_data = output.getvalue()
+                
+                st.download_button(
+                    label="📥 Baixar Relatório de Auditoria (Excel)",
+                    data=processed_data,
+                    file_name="relatorio_auditoria_xml.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+# --- ABA 2: CONSULTA DE ST POR NCM E UF ---
+with aba2:
+    st.header("Consulta Geral de Substituição Tributária")
+    st.write("Verifique a aplicabilidade da ST e sua respectiva MVA/Base Legal digitando o NCM do produto e o Estado de destino.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        ncm_busca = st.text_input("Digite o NCM para consulta (ex: 22030000, 30041010):").strip()
+    with col2:
+        uf_busca = st.selectbox("Selecione o Estado (UF)", ["SP", "RJ", "MG", "PR", "BA", "RS", "SC", "PE"])
         
-        for nome_xml, bytes_xml in lista_arquivos_processar:
-            dados_nota = ler_nfe(bytes_xml, nome_xml)
-            avaliar_nota(dados_nota, base_tributaria_exemplo, alertas)
-            
-        if alertas:
-            df_resultados = pd.DataFrame(alertas)
-            st.success(f"🚨 Auditoria concluída! Foram encontradas {len(alertas)} inconformidades.")
-            
-            # Exibe os dados de maneira interativa na página
-            st.dataframe(df_resultados)
-            
-            # Botão de download do relatório em formato CSV
+    if ncm_busca:
+        filtro = df_st[(df_st["NCM"] == ncm_busca) & (df_st["UF"] == uf_busca)]
+        if not filtro.empty:
+            st.success("Regra de ST Encontrada!")
+            st.table(filtro)
+        else:
+            st.info(f"Nenhuma regra específica de ST cadastrada para o NCM {ncm_busca} no estado de {uf_busca}. Certifique-se de que o produto não é tributado de forma geral ou Isento.")
+
+# --- ABA 3: TABELAS DO SPED ---
+with aba3:
+    st.header("Tabelas Oficiais do SPED (Regime Monofásico)")
+    st.write("Abaixo constam as bases configuradas para validação do PIS/COFINS Monofásico:")
+    
+    col_tabela1, col_tabela2 = st.columns(2)
+    
+    with col_tabela1:
+        st.subheader("Tabela 4.3.10 / 4.3.11 Simplificada")
+        df_view_mono = pd.DataFrame.from_dict(db_monofasico, orient='index').reset_index()
+        df_view_mono.columns = ["NCM Alvo", "CST PIS Correto", "CST COFINS Correto", "Base Legal / Segmento"]
+        st.dataframe(df_view_mono, use_container_width=True)
