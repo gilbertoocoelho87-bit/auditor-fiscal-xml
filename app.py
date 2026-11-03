@@ -9,7 +9,6 @@ st.set_page_config(page_title="Auditor Fiscal Digital - XML & NCM", layout="wide
 # --- BANCO DE DADOS EM MEMÓRIA ---
 @st.cache_data
 def carregar_dados_monofasicos():
-    # Exemplo de NCMs monofásicos das Tabelas 4.3.10 e 4.3.11 do SPED
     return {
         "30041010": {"CST_PIS_CORRETO": "02", "CST_COFINS_CORRETO": "02", "Desc": "Medicamentos - Tabela 4.3.10"},
         "22030000": {"CST_PIS_CORRETO": "02", "CST_COFINS_CORRETO": "02", "Desc": "Cervejas - Tabela 4.3.11"},
@@ -19,7 +18,6 @@ def carregar_dados_monofasicos():
 
 @st.cache_data
 def carregar_legislacao_st():
-    # Simulação de base de dados de ST por Estado e NCM
     return pd.DataFrame([
         {"NCM": "22030000", "UF": "SP", "ST_Aplicavel": "Sim", "MVA_Original": "70%", "Base_Legal": "Artigo 313-A do RICMS/SP"},
         {"NCM": "22030000", "UF": "RJ", "ST_Aplicavel": "Sim", "MVA_Original": "65%", "Base_Legal": "Decreto nº 44.444/RJ"},
@@ -27,63 +25,67 @@ def carregar_legislacao_st():
         {"NCM": "40111000", "UF": "PR", "ST_Aplicavel": "Sim", "MVA_Original": "45%", "Base_Legal": "Artigo 120 do RICMS/PR"}
     ])
 
-# --- FUNÇÃO DE ANÁLISE DOS XMLs ---
+# --- FUNÇÃO DE ANÁLISE DOS XMLs (VERSÃO UNIVERSAL) ---
 def analisar_xmls(arquivos_xml, db_monofasico):
     resultados = []
     
     for arquivo in arquivos_xml:
         try:
-            # Ler conteúdo do XML carregado na memória
+            # Ler conteúdo do XML tirando ponteiros residuais
+            arquivo.seek(0)
             conteudo = arquivo.read()
             root = ET.fromstring(conteudo)
             
-            # Namespace padrão da NF-e
-            ns = {'nfe': 'http://portalfiscal.inf.br'}
+            # Remove dinamicamente os namespaces para simplificar a busca de tags
+            for elem in root.iter():
+                if '}' in elem.tag:
+                    elem.tag = elem.tag.split('}', 1)[1]
             
-            # Identificação da Nota e UF do Emitente
-            ide = root.find('.//nfe:ide', ns)
-            emit = root.find('.//nfe:emit', ns)
-            infNFe = root.find('.//nfe:infNFe', ns)
+            # Identificação básica da nota
+            infNFe = root.find('.//infNFe')
+            chNFe = infNFe.attrib.get('Id', 'Desconhecido')[3:] if infNFe is not None and 'Id' in infNFe.attrib else "Sem Chave"
             
-            chNFe = infNFe.attrib.get('Id', 'Desconhecido')[3:] if infNFe is not None else "Sem Chave"
-            uf_emit = emit.find('nfe:enderEmit/nfe:UF', ns).text if emit is not None and emit.find('nfe:enderEmit/nfe:UF', ns) is not None else "XX"
+            emit = root.find('.//emit')
+            uf_emit = "XX"
+            if emit is not None:
+                uf_node = emit.find('.//UF')
+                if uf_node is not None:
+                    uf_emit = uf_node.text
             
-            # Percorrer produtos da nota
-            detalhes_itens = root.findall('.//nfe:det', ns)
-            if not detalhes_itens:
-                continue
-                
+            # Percorrer produtos de forma universal
+            detalhes_itens = root.findall('.//det')
+            
             for det in detalhes_itens:
                 num_item = det.attrib.get('nItem', '0')
-                prod = det.find('nfe:prod', ns)
-                imposto = det.find('nfe:imposto', ns)
+                prod = det.find('prod')
+                imposto = det.find('imposto')
                 
                 if prod is None:
                     continue
                     
-                xProd = prod.find('nfe:xProd', ns).text if prod.find('nfe:xProd', ns) is not None else "Desconhecido"
-                ncm = prod.find('nfe:NCM', ns).text if prod.find('nfe:NCM', ns) is not None else "00000000"
+                xProd_node = prod.find('xProd')
+                ncm_node = prod.find('NCM')
+                
+                xProd = xProd_node.text if xProd_node is not None else "Desconhecido"
+                ncm = ncm_node.text if ncm_node is not None else "00000000"
                 
                 cst_pis_atual = "N/A"
                 cst_cofins_atual = "N/A"
                 
                 if imposto is not None:
-                    pis = imposto.find('.//nfe:PIS', ns)
-                    cofins = imposto.find('.//nfe:COFINS', ns)
-                    
-                    # Tenta capturar o CST de PIS enviado
-                    if pis is not None:
-                        for child in pis:
-                            cst_node = child.find('nfe:CST', ns)
-                            if cst_node is not None: 
-                                cst_pis_atual = cst_node.text
-                    
-                    # Tenta capturar o CST de COFINS enviado
-                    if cofins is not None:
-                        for child in cofins:
-                            cst_node = child.find('nfe:CST', ns)
-                            if cst_node is not None: 
-                                cst_cofins_atual = cst_node.text
+                    # Busca recursiva por qualquer tag contendo CST dentro de PIS
+                    pis_node = imposto.find('.//PIS')
+                    if pis_node is not None:
+                        cst_node = pis_node.find('.//CST')
+                        if cst_node is not None:
+                            cst_pis_atual = cst_node.text
+                            
+                    # Busca recursiva por qualquer tag contendo CST dentro de COFINS
+                    cofins_node = imposto.find('.//COFINS')
+                    if cofins_node is not None:
+                        cst_node = cofins_node.find('.//CST')
+                        if cst_node is not None:
+                            cst_cofins_atual = cst_node.text
                 
                 # --- VALIDAÇÃO MONOFÁSICA ---
                 erro_encontrado = False
@@ -97,9 +99,9 @@ def analisar_xmls(arquivos_xml, db_monofasico):
                     cst_cofins_correto = db_monofasico[ncm]["CST_COFINS_CORRETO"]
                     base_legal_sped = db_monofasico[ncm]["Desc"]
                     
-                    if cst_pis_atual != cst_pis_correto or cst_cofins_atual != cst_cofins_correto:
+                    if str(cst_pis_atual).zfill(2) != str(cst_pis_correto).zfill(2) or str(cst_cofins_atual).zfill(2) != str(cst_cofins_correto).zfill(2):
                         erro_encontrado = True
-                        motivo_erro = f"NCM Monofásico. CST enviado ({cst_pis_atual}/{cst_cofins_atual}) diverge do correto ({cst_pis_correto}/{cst_cofins_correto}). Ref: {base_legal_sped}"
+                        motivo_erro = f"NCM Monofásico. CST enviado ({cst_pis_atual}/{cst_cofins_atual}) diverge do correto ({cst_pis_correto}/{cst_cofins_correto})."
                 
                 resultados.append({
                     "Chave NF-e": chNFe,
@@ -145,13 +147,11 @@ with aba1:
             with st.spinner("Analisando tags e cruzando com as legislações vigentes..."):
                 df_resultado = analisar_xmls(arquivos_carregados, db_monofasico)
                 
-                # --- TRATAMENTO DEFENSIVO DO DATAFRAME ---
                 if df_resultado.empty:
-                    st.warning("⚠️ Nenhum item ou produto válido foi localizado ou estruturado a partir dos XMLs processados.")
+                    st.warning("⚠️ Nenhum item ou produto válido foi localizado ou estruturado a partir dos XMLs processados. Certifique-se de que os arquivos contêm a estrutura padrão de itens (<det>).")
                 else:
-                    # Verifica de forma segura se a coluna de erro foi povoada
                     if "Possui Erro?" in df_resultado.columns:
-                        total_erros = int(df_resultado[df_resultado["Possui Erro?"] == "⚠️ Sim"].shape[0])
+                        total_erros = int((df_resultado["Possui Erro?"] == "⚠️ Sim").sum())
                     else:
                         total_erros = 0
                     
@@ -161,7 +161,7 @@ with aba1:
                     # Mostrar tabela com os dados
                     st.dataframe(df_resultado, use_container_width=True)
                     
-                    # Permitir download do relatório em Excel / CSV
+                    # Permitir download do relatório em Excel
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                         df_resultado.to_excel(writer, index=False, sheet_name='Auditoria_XML')
@@ -199,3 +199,4 @@ with aba3:
     st.write("Abaixo constam as bases configuradas para validação do PIS/COFINS Monofásico:")
     
     df_view_mono = pd.DataFrame.from_dict(db_monofasico, orient='index').reset_index()
+    df_view_mono.columns = ["NCM Alvo", "CST PIS Correto", "CST COFINS Correto", "Base Legal / Segmento"]
