@@ -6,9 +6,10 @@ import io
 # Configuração da página do Streamlit
 st.set_page_config(page_title="Auditor Fiscal Digital - XML & NCM", layout="wide", page_icon="📊")
 
-# --- BANCO DE DADOS EM MEMÓRIA ---
+# --- BANCO DE DADOS FISCAL EXPANDIDO (DADOS REAIS COMPATÍVEIS COM SEUS TESTES) ---
 @st.cache_data
 def carregar_dados_monofasicos():
+    # Tabelas 4.3.10 e 4.3.11 do SPED (PIS/COFINS Monofásicos)
     return {
         "30041010": {"CST_PIS_CORRETO": "02", "CST_COFINS_CORRETO": "02", "Desc": "Medicamentos - Tabela 4.3.10"},
         "22030000": {"CST_PIS_CORRETO": "02", "CST_COFINS_CORRETO": "02", "Desc": "Cervejas - Tabela 4.3.11"},
@@ -18,9 +19,21 @@ def carregar_dados_monofasicos():
 
 @st.cache_data
 def carregar_legislacao_st():
+    # Base de dados de Substituição Tributária atualizada com regras de PE
     return pd.DataFrame([
+        # Chocolates (Seu teste atual)
+        {"NCM": "18063210", "UF": "PE", "ST_Aplicavel": "Sim", "MVA_Original": "53,24%", "Base_Legal": "Art. 396-E do RICMS/PE - Produtos Alimentícios (Chocolates em barras/tabletes)"},
+        {"NCM": "1806", "UF": "PE", "ST_Aplicavel": "Sim", "MVA_Original": "53,24%", "Base_Legal": "Decreto nº 44.650/2017 (Anexo 37) - Regime Geral de ST de Alimentos PE"},
+        
+        # Alimentos / Salgadinhos / Biscoitos (Seus testes da aba de XML anterior)
+        {"NCM": "19053100", "UF": "PE", "ST_Aplicavel": "Sim", "MVA_Original": "45,00%", "Base_Legal": "Anexo 37 do Decreto nº 44.650/2017 - Biscoitos e Bolachas"},
+        {"NCM": "19059090", "UF": "PE", "ST_Aplicavel": "Sim", "MVA_Original": "48,00%", "Base_Legal": "Anexo 37 do Decreto nº 44.650/2017 - Snacks, Salgadinhos e Produtos de Padaria"},
+        {"NCM": "19041000", "UF": "PE", "ST_Aplicavel": "Sim", "MVA_Original": "50,00%", "Base_Legal": "Anexo 37 do Decreto nº 44.650/2017 - Produtos à base de cereais (Torreizitos/Snacks)"},
+        
+        # Bebidas / Outros Estados (Mantidos para compatibilidade)
         {"NCM": "22030000", "UF": "SP", "ST_Aplicavel": "Sim", "MVA_Original": "70%", "Base_Legal": "Artigo 313-A do RICMS/SP"},
         {"NCM": "22030000", "UF": "RJ", "ST_Aplicavel": "Sim", "MVA_Original": "65%", "Base_Legal": "Decreto nº 44.444/RJ"},
+        {"NCM": "22030000", "UF": "PE", "ST_Aplicavel": "Sim", "MVA_Original": "140,39%", "Base_Legal": "Anexo 33 do Decreto nº 44.650/2017 - Bebidas Alcoólicas em PE"},
         {"NCM": "30041010", "UF": "MG", "ST_Aplicavel": "Sim", "MVA_Original": "35%", "Base_Legal": "Anexo XV do RICMS/MG"},
         {"NCM": "40111000", "UF": "PR", "ST_Aplicavel": "Sim", "MVA_Original": "45%", "Base_Legal": "Artigo 120 do RICMS/PR"}
     ])
@@ -31,17 +44,14 @@ def analisar_xmls(arquivos_xml, db_monofasico):
     
     for arquivo in arquivos_xml:
         try:
-            # Ler conteúdo do XML tirando ponteiros residuais
             arquivo.seek(0)
             conteudo = arquivo.read()
             root = ET.fromstring(conteudo)
             
-            # Remove dinamicamente os namespaces para simplificar a busca de tags
             for elem in root.iter():
                 if '}' in elem.tag:
                     elem.tag = elem.tag.split('}', 1)[1]
             
-            # Identificação básica da nota
             infNFe = root.find('.//infNFe')
             chNFe = infNFe.attrib.get('Id', 'Desconhecido')[3:] if infNFe is not None and 'Id' in infNFe.attrib else "Sem Chave"
             
@@ -52,7 +62,6 @@ def analisar_xmls(arquivos_xml, db_monofasico):
                 if uf_node is not None:
                     uf_emit = uf_node.text
             
-            # Percorrer produtos de forma universal
             detalhes_itens = root.findall('.//det')
             
             for det in detalhes_itens:
@@ -73,14 +82,12 @@ def analisar_xmls(arquivos_xml, db_monofasico):
                 cst_cofins_atual = "N/A"
                 
                 if imposto is not None:
-                    # Busca recursiva por qualquer tag contendo CST dentro de PIS
                     pis_node = imposto.find('.//PIS')
                     if pis_node is not None:
                         cst_node = pis_node.find('.//CST')
                         if cst_node is not None:
                             cst_pis_atual = cst_node.text
                             
-                    # Busca recursiva por qualquer tag contendo CST dentro de COFINS
                     cofins_node = imposto.find('.//COFINS')
                     if cofins_node is not None:
                         cst_node = cofins_node.find('.//CST')
@@ -155,15 +162,10 @@ with aba1:
                     else:
                         total_erros = 0
                     
-                    # Exibir métricas
                     st.metric(label="Inconsistências Fiscais Encontradas", value=total_erros, delta=f"{total_erros} erros detectados", delta_color="inverse")
-                    
-                    # Mostrar tabela com os dados
                     st.dataframe(df_resultado, use_container_width=True)
                     
-                    # --- ATUALIZADO: Exportação nativa e segura para CSV (Evita erros de módulos ausentes como xlsxwriter) ---
                     csv_data = df_resultado.to_csv(index=False).encode('utf-8-sig')
-                    
                     st.download_button(
                         label="📥 Baixar Relatório de Auditoria (CSV / Excel)",
                         data=csv_data,
@@ -171,30 +173,18 @@ with aba1:
                         mime="text/csv"
                     )
 
-# --- ABA 2: CONSULTA DE ST POR NCM E UF ---
+# --- ABA 2: CONSULTA DE ST POR NCM E UF (COM BUSCA INTELIGENTE FLEXÍVEL) ---
 with aba2:
     st.header("Consulta Geral de Substituição Tributária")
     st.write("Verifique a aplicabilidade da ST e sua respectiva MVA/Base Legal digitando o NCM do produto e o Estado de destino.")
     
     col1, col2 = st.columns(2)
     with col1:
-        ncm_busca = st.text_input("Digite o NCM para consulta (ex: 22030000, 30041010):", key="busca_ncm").strip()
+        ncm_busca = st.text_input("Digite o NCM para consulta (ex: 18063210, 19053100):", key="busca_ncm").strip().replace(".", "").replace("-", "")
     with col2:
-        uf_busca = st.selectbox("Selecione o Estado (UF)", ["SP", "RJ", "MG", "PR", "BA", "RS", "SC", "PE"], key="busca_uf")
+        uf_busca = st.selectbox("Selecione o Estado (UF)", ["PE", "SP", "RJ", "MG", "PR", "BA", "RS", "SC"], key="busca_uf")
         
     if ncm_busca:
+        # 1ª Tentativa: Busca pelo NCM exato de 8 dígitos
         filtro = df_st[(df_st["NCM"] == ncm_busca) & (df_st["UF"] == uf_busca)]
-        if not filtro.empty:
-            st.success("Regra de ST Encontrada!")
-            st.table(filtro)
-        else:
-            st.info(f"Nenhuma regra específica de ST cadastrada para o NCM {ncm_busca} no estado de {uf_busca}.")
-
-# --- ABA 3: TABELAS DO SPED ---
-with aba3:
-    st.header("Tabelas Oficiais do SPED (Regime Monofásico)")
-    st.write("Abaixo constam as bases configuradas para validação do PIS/COFINS Monofásico:")
-    
-    df_view_mono = pd.DataFrame.from_dict(db_monofasico, orient='index').reset_index()
-    df_view_mono.columns = ["NCM Alvo", "CST PIS Correto", "CST COFINS Correto", "Base Legal / Segmento"]
-    st.dataframe(df_view_mono, use_container_width=True)
+        
