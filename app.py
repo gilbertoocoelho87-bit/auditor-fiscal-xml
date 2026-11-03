@@ -148,7 +148,7 @@ with aba1:
                 df_resultado = analisar_xmls(arquivos_carregados, db_monofasico)
                 
                 if df_resultado.empty:
-                    st.warning("⚠️ Nenhum item ou produto válido foi localizado ou estruturado a partir dos XMLs processados. Certifique-se de que os arquivos contêm a estrutura padrão de itens (<det>).")
+                    st.warning("⚠️ Nenhum item ou produto válido foi localizado ou estruturado a partir dos XMLs processados.")
                 else:
                     if "Possui Erro?" in df_resultado.columns:
                         total_erros = int((df_resultado["Possui Erro?"] == "⚠️ Sim").sum())
@@ -161,17 +161,14 @@ with aba1:
                     # Mostrar tabela com os dados
                     st.dataframe(df_resultado, use_container_width=True)
                     
-                    # Permitir download do relatório em Excel
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        df_resultado.to_excel(writer, index=False, sheet_name='Auditoria_XML')
-                    processed_data = output.getvalue()
+                    # --- ATUALIZADO: Exportação nativa e segura para CSV (Evita erros de módulos ausentes como xlsxwriter) ---
+                    csv_data = df_resultado.to_csv(index=False).encode('utf-8-sig')
                     
                     st.download_button(
-                        label="📥 Baixar Relatório de Auditoria (Excel)",
-                        data=processed_data,
-                        file_name="relatorio_auditoria_xml.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        label="📥 Baixar Relatório de Auditoria (CSV / Excel)",
+                        data=csv_data,
+                        file_name="relatorio_auditoria_xml.csv",
+                        mime="text/csv"
                     )
 
 # --- ABA 2: CONSULTA DE ST POR NCM E UF ---
@@ -200,3 +197,4 @@ with aba3:
     
     df_view_mono = pd.DataFrame.from_dict(db_monofasico, orient='index').reset_index()
     df_view_mono.columns = ["NCM Alvo", "CST PIS Correto", "CST COFINS Correto", "Base Legal / Segmento"]
+    st.dataframe(df_view_mono, use_container_width=True)
