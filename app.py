@@ -59,13 +59,31 @@ def so_digitos(v):
 # ---------------------------------------------------------------------------
 # 1) IA: classificação por NCM x UF (com busca na web)
 # ---------------------------------------------------------------------------
-def get_key():
+_NOMES_CHAVE = ("ANTHROPIC_API_KEY", "anthropic_api_key", "CLAUDE_API_KEY", "API_KEY", "api_key")
+
+
+def _secrets():
     try:
-        if "ANTHROPIC_API_KEY" in st.secrets:
-            return st.secrets["ANTHROPIC_API_KEY"]
+        return {k: v for k, v in st.secrets.items()}
     except Exception:
-        pass
-    return os.environ.get("ANTHROPIC_API_KEY", "")
+        return {}
+
+
+def _buscar_chave(d):
+    for nome in _NOMES_CHAVE:
+        if nome in d and isinstance(d[nome], str) and d[nome].strip():
+            return d[nome]
+    for v in d.values():
+        if hasattr(v, "items"):
+            r = _buscar_chave(dict(v.items()))
+            if r:
+                return r
+    return ""
+
+
+def get_key():
+    k = st.session_state.get("chave_manual") or _buscar_chave(_secrets()) or os.environ.get("ANTHROPIC_API_KEY", "")
+    return str(k).strip().strip('"').strip("'").strip()
 
 
 def get_modelo():
@@ -509,9 +527,18 @@ st.title("🧾 Auditor Fiscal de XML com IA")
 st.caption("Simples Nacional | ICMS-ST por UF | PIS/COFINS monofásico (SPED 4.3.10/4.3.11) | CFOP | CSOSN | legislação")
 
 if not get_key():
-    st.error("Chave da IA não configurada - a análise está bloqueada. No Streamlit Cloud: **Manage app > Settings > "
-             "Secrets** e cole `ANTHROPIC_API_KEY = \"sua-chave\"` (chave criada em console.anthropic.com). "
-             "Salve e o app reinicia sozinho.")
+    st.error("Chave da IA não encontrada - a análise está bloqueada.")
+    nomes = list(_secrets().keys())
+    st.write("Nomes encontrados nos Secrets do app: " + (", ".join(f"`{n}`" for n in nomes) if nomes else "**nenhum**"))
+    st.markdown("Em **Manage app > Settings > Secrets** deve existir exatamente uma linha, sem espaços extras e com aspas retas:\n\n"
+                "`ANTHROPIC_API_KEY = \"sk-ant-...\"`\n\n"
+                "Depois de salvar, use **Reboot app** no menu do app. Ou cole a chave abaixo (vale só nesta sessão):")
+    st.text_input("Chave da API Anthropic", type="password", key="chave_input")
+    if st.session_state.get("chave_input"):
+        st.session_state["chave_manual"] = st.session_state["chave_input"]
+        st.rerun()
+elif not get_key().startswith("sk-ant-"):
+    st.warning("A chave cadastrada não começa com `sk-ant-`: confira se copiou a chave inteira e correta.")
 
 aba1, aba2 = st.tabs(["📂 Análise em lote", "🔎 Consulta por NCM"])
 
