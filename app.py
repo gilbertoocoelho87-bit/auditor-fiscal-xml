@@ -163,14 +163,39 @@ def buscar_mono(ncm):
 def buscar_st(ncm, uf):
     ncm = so_digitos(ncm)
     df = st.session_state["st"]
+    so_uf = st.session_state.get("so_base_uf", False)
     achados = []
     for _, r in df.iterrows():
         p = so_digitos(r["ncm_prefixo"])
-        if p and ncm.startswith(p) and r["uf"] in ("*", "", uf):
-            achados.append(r)
-    # prioriza regra específica da UF sobre "*"
-    achados.sort(key=lambda r: 0 if r["uf"] == uf else 1)
-    return achados[0] if achados else None
+        if not (p and ncm.startswith(p)):
+            continue
+        if r["uf"] == uf or (not so_uf and r["uf"] in ("*", "")):
+            achados.append((0 if r["uf"] == uf else 1, -len(p), r))
+    achados.sort(key=lambda x: (x[0], x[1]))
+    return achados[0][2] if achados else None
+
+
+def uf_da_st(nota):
+    esc = st.session_state.get("uf_st", "")
+    return esc if esc in UFS else (nota["dest_uf"] or nota["emit_uf"])
+
+
+def normaliza_st(df):
+    """Aceita lista oficial de uma UF (só NCM, ou NCM+CEST) e completa as colunas."""
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    for alt in ("ncm", "ncm/sh", "ncm_sh"):
+        if alt in df.columns and "ncm_prefixo" not in df.columns:
+            df = df.rename(columns={alt: "ncm_prefixo"})
+    uf_esc = st.session_state.get("uf_st", "")
+    if "uf" not in df.columns:
+        df["uf"] = uf_esc if uf_esc in UFS else "*"
+    for c in ("segmento", "mva", "legislacao"):
+        if c not in df.columns:
+            df[c] = ""
+    df["ncm_prefixo"] = df["ncm_prefixo"].map(so_digitos)
+    df["legislacao"] = [l or f"Lista de ST importada - {ricms(u)}" for l, u in zip(df["legislacao"], df["uf"])]
+    return df.fillna("")
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +334,7 @@ def aliq_pc_correta():
 def auditar_item(nota, it):
     erros = []
     uf_o, uf_d = nota["emit_uf"], nota["dest_uf"] or nota["emit_uf"]
-    simples = nota["crt"] in ("1", "2")
+    simples = True  # análise SEMPRE para empresas do Simples Nacional
     cst, cf = it["cst_icms"], it["cfop"]
     interna = uf_o == uf_d
 
@@ -320,6 +345,10 @@ def auditar_item(nota, it):
             "Informado": informado, "Correto": correto, "Gravidade": "ERRO",
             "Legislação": leg, "Arquivo": nota["arquivo"], "Chave": nota["chave"],
         })
+
+    if nota["crt"] not in ("1", "2") and it["item"] in ("1", ""):
+        add("CRT", nota["crt"] or "(vazio)", "1 - Simples Nacional (ou 2 - excesso de sublimite)",
+            "LC 123/2006; leiaute NF-e (Ajuste SINIEF 07/2005)")
 
     # --- NCM ---
     if len(it["ncm"]) != 8:
@@ -333,10 +362,11 @@ def auditar_item(nota, it):
             add("CFOP", cf, "Iniciar com 6 (operação interestadual)", "Ajuste SINIEF 07/2001 (Tabela de CFOP)")
 
     # --- ICMS: ST x tributado normal (veredito pela base) ---
-    regra_st = buscar_st(it["ncm"], uf_d)
+    uf_st = uf_da_st(nota)
+    regra_st = buscar_st(it["ncm"], uf_st)
     if regra_st is not None:
         seg = regra_st["segmento"]
-        leg = f"{regra_st['legislacao']} | {ricms(uf_d)} | LC 87/1996, arts. 6º a 10"
+        leg = f"{regra_st['legislacao']} | {ricms(uf_st)} | LC 87/1996, arts. 6º a 10"
         if cst not in CST_ST | CST_ST_RETIDA:
             add("CST/CSOSN ICMS", cst,
                 ("500" if simples else "60") + f" - ICMS-ST já retido na entrada (NCM do segmento {seg})", leg)
@@ -350,7 +380,7 @@ def auditar_item(nota, it):
             add("CEST", "(vazio)", f"Informar o CEST do segmento {seg} (obrigatório para NCM sujeito à ST)",
                 "Convênio ICMS 142/2018, cláusula 1ª-A")
     else:
-        leg = f"{ricms(uf_d)} - NCM sem ST na UF de destino"
+        leg = f"{ricms(uf_st)} - NCM sem ST em {uf_st}"
         if cst in CST_ST | CST_ST_RETIDA:
             add("CST/CSOSN ICMS", cst, ("102" if simples else "00") + " - tributação normal (NCM sem ST)", leg)
         if cf in CFOP_ST_SUBST | CFOP_ST_RETIDA:
@@ -393,8 +423,7 @@ def auditar_item(nota, it):
 
 
 def classificar(nota, it):
-    uf_d = nota["dest_uf"] or nota["emit_uf"]
-    e_st = buscar_st(it["ncm"], uf_d) is not None
+    e_st = buscar_st(it["ncm"], uf_da_st(nota)) is not None
     e_mono = buscar_mono(it["ncm"]) is not None
     return {"nota": nota["numero"], "item": it["item"], "ncm": it["ncm"], "vProd": it["vProd"],
             "vICMSST": it["vICMSST"], "vPISCOF": it["vPIS"] + it["vCOFINS"], "st": e_st, "mono": e_mono}
@@ -527,17 +556,26 @@ with st.sidebar:
         st.session_state["mono"] = pd.read_csv(up_mono, dtype=str, sep=None, engine="python").fillna("")
         st.success(f"{len(st.session_state['mono'])} linhas de monofásicos carregadas")
     if up_st:
-        st.session_state["st"] = pd.read_csv(up_st, dtype=str, sep=None, engine="python").fillna("")
-        st.success(f"{len(st.session_state['st'])} linhas de ST carregadas")
+        novo_st = normaliza_st(pd.read_csv(up_st, dtype=str, sep=None, engine="python"))
+        base_st = st.session_state["st"].reindex(columns=list(novo_st.columns)).fillna("")
+        st.session_state["st"] = (pd.concat([base_st, novo_st], ignore_index=True)
+                                  .drop_duplicates(subset=["uf", "ncm_prefixo"], keep="last"))
+        st.success(f"{len(novo_st)} linhas de ST importadas (UF: {', '.join(sorted(set(novo_st['uf'])))})")
     st.info(f"Monofásicos: {len(st.session_state['mono'])} regras\n\nST: {len(st.session_state['st'])} regras")
-
-with st.sidebar:
-    st.selectbox("Regime de PIS/COFINS do emitente", ["Cumulativo (Lucro Presumido)", "Não cumulativo (Lucro Real)"], key="regime_pc")
 
 aba1, aba2, aba3 = st.tabs(["📂 Análise em lote", "🔎 Consulta por NCM", "🗄️ Bases de dados"])
 
 # ---- Aba 1 ----
 with aba1:
+    cA, cB = st.columns([1, 2])
+    cA.selectbox("UF da legislação de ST", ["Automático (UF do destinatário)"] + UFS, key="uf_st")
+    cB.checkbox("Usar somente os NCMs cadastrados para esta UF (ignorar a base nacional '*')", key="so_base_uf")
+    st.caption("Análise fixa para empresas do **Simples Nacional** (CSOSN). A UF escolhida define a lista de ST, "
+               "a legislação citada e o CFOP/CSOSN correto.")
+    _uf = st.session_state.get("uf_st", "")
+    if st.session_state.get("so_base_uf") and _uf in UFS and not (st.session_state["st"]["uf"] == _uf).any():
+        st.warning(f"Não há NCMs cadastrados para {_uf}. Importe a lista de ST de {_uf} na barra lateral, "
+                   "senão todos os itens serão tratados como SEM ST.")
     arquivos = st.file_uploader("Envie XMLs (ou ZIP com XMLs)", type=["xml", "zip"], accept_multiple_files=True)
     if arquivos and st.button("Analisar", type="primary"):
         todos, itens_total, falhas, linhas_itens = [], 0, [], []
@@ -589,6 +627,7 @@ with aba1:
 
         st.divider()
         st.subheader("📊 Resumo final: ST, Monofásico e Tributado")
+        st.caption(f"Legislação de ST aplicada: {st.session_state.get('uf_st', '')}  |  Simples Nacional")
         resumo = montar_resumo(st.session_state.get("itens_df"))
         if not resumo.empty:
             m1, m2, m3 = st.columns(3)
