@@ -292,10 +292,23 @@ def _grupo(pai, nome):
     return None
 
 
+class XmlIgnorado(Exception):
+    """XML que não é NF-e (evento, cancelamento, inutilização)."""
+    def __init__(self, motivo, chave_cancelada=""):
+        super().__init__(motivo)
+        self.motivo, self.chave_cancelada = motivo, chave_cancelada
+
+
 def parse_nfe(conteudo, nome):
     root = ET.fromstring(conteudo)
     inf = next((e for e in root.iter() if _tag(e) == "infNFe"), None)
     if inf is None:
+        ev = next((e for e in root.iter() if _tag(e) == "infEvento"), None)
+        if ev is not None:
+            tp, ch = _txt(ev, "tpEvento"), _txt(ev, "chNFe")
+            raise XmlIgnorado(f"evento {tp}", ch if tp == "110111" else "")
+        if any(_tag(e) in ("infInut", "retInutNFe") for e in root.iter()):
+            raise XmlIgnorado("inutilização")
         raise ValueError("Não é um XML de NF-e/NFC-e (infNFe não encontrado).")
     nota = {
         "arquivo": nome, "chave": inf.attrib.get("Id", "")[3:], "numero": _txt(inf, "ide/nNF"),
@@ -496,8 +509,9 @@ st.title("🧾 Auditor Fiscal de XML com IA")
 st.caption("Simples Nacional | ICMS-ST por UF | PIS/COFINS monofásico (SPED 4.3.10/4.3.11) | CFOP | CSOSN | legislação")
 
 if not get_key():
-    st.error("Chave da IA não configurada. Cadastre **ANTHROPIC_API_KEY** em Settings > Secrets (Streamlit Cloud) "
-             "ou em `.streamlit/secrets.toml`. Sem ela o app usa apenas uma base interna parcial.")
+    st.error("Chave da IA não configurada - a análise está bloqueada. No Streamlit Cloud: **Manage app > Settings > "
+             "Secrets** e cole `ANTHROPIC_API_KEY = \"sua-chave\"` (chave criada em console.anthropic.com). "
+             "Salve e o app reinicia sozinho.")
 
 aba1, aba2 = st.tabs(["📂 Análise em lote", "🔎 Consulta por NCM"])
 
@@ -505,7 +519,7 @@ with aba1:
     st.selectbox("UF da legislação de ST", [AUTO] + UFS, key="uf_st")
     arquivos = st.file_uploader("Envie os XMLs (ou um ZIP com XMLs)", type=["xml", "zip"], accept_multiple_files=True)
 
-    if arquivos and st.button("Analisar e corrigir", type="primary"):
+    if arquivos and st.button("Analisar e corrigir", type="primary", disabled=not get_key()):
         entradas = []
         for f in arquivos:
             if f.name.lower().endswith(".zip"):
@@ -515,14 +529,21 @@ with aba1:
                 entradas.append((f.name, f.read()))
 
         notas, falhas, pares = [], [], set()
+        cancel, n_eventos = set(), 0
         for nome, conteudo in entradas:
             try:
-                nota, itens = parse_nfe(conteudo, nome)
-                notas.append((nota, itens))
-                uf_st = uf_da_st(nota)
-                pares |= {(uf_st, it["ncm"]) for it in itens if len(it["ncm"]) == 8}
+                notas.append(parse_nfe(conteudo, nome))
+            except XmlIgnorado as x:
+                n_eventos += 1
+                if x.chave_cancelada:
+                    cancel.add(x.chave_cancelada)
             except Exception as e:
                 falhas.append((nome, str(e)))
+        n_canc = sum(1 for n, _ in notas if n["chave"] in cancel)
+        notas = [(n, i) for n, i in notas if n["chave"] not in cancel]
+        for nota, itens in notas:
+            uf_st = uf_da_st(nota)
+            pares |= {(uf_st, it["ncm"]) for it in itens if len(it["ncm"]) == 8}
 
         with st.status(f"Consultando legislação de {len(pares)} NCM(s) com a IA...", expanded=False) as status:
             infos, avisos = obter_infos(pares)
@@ -537,15 +558,18 @@ with aba1:
                 linhas_itens.append(classificar(nota, it, info))
         st.session_state["res"] = {
             "erros": pd.DataFrame(erros), "itens": pd.DataFrame(linhas_itens), "infos": infos,
-            "avisos": avisos, "falhas": falhas, "n_xml": len(entradas), "uf": st.session_state.get("uf_st", AUTO)}
+            "avisos": avisos, "falhas": falhas, "n_xml": len(notas), "n_canc": n_canc, "n_eventos": n_eventos, "uf": st.session_state.get("uf_st", AUTO)}
 
     r = st.session_state.get("res")
     if r:
         df, resumo = r["erros"], montar_resumo(r["itens"])
         c1, c2, c3 = st.columns(3)
-        c1.metric("XMLs lidos", r["n_xml"])
+        c1.metric("NF-e analisadas", r["n_xml"])
         c2.metric("Itens analisados", len(r["itens"]))
         c3.metric("Erros a corrigir", len(df))
+        if r["n_canc"] or r["n_eventos"]:
+            st.info(f"{r['n_canc']} nota(s) cancelada(s) excluída(s) da análise; "
+                    f"{r['n_eventos']} arquivo(s) de evento/inutilização ignorado(s).")
         for nome, msg in r["falhas"]:
             st.warning(f"{nome}: {msg}")
         for a in r["avisos"]:
