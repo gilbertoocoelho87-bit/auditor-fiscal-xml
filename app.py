@@ -11,7 +11,6 @@ st.set_page_config(page_title="Auditor Fiscal XML", layout="wide", page_icon="�
 # ==============================================================================
 @st.cache_data
 def carregar_base_tributaria():
-    # Simulação expandida das Tabelas 4.3.10 / 4.3.11 do SPED e Regras de ST gerais
     dados = [
         {
             "NCM": "62046900", "UF": "PE", "Descricao_NCM": "Vestuário e acessórios têxteis",
@@ -109,30 +108,29 @@ if arquivos_carregados:
         
         st.info(f"📊 Total de itens processados no lote: {len(df_xml)}")
         
-        # --- MOTOR DE REGRAS DINÂMICO (Roda mesmo se o NCM não estiver na tabela exemplo) ---
+        # --- MOTOR DE REGRAS DINÂMICO ---
         erros_encontrados = []
         
         for idx, row in df_auditado.iterrows():
             motivo_erro = []
             
-            # Se o NCM existe na nossa base, valida de forma rígida
+            # Se o NCM existe na nossa base cadastrada, valida de forma rígida
             if pd.notna(row['Regime_ICMS']):
                 if row['CFOP_Emitido'] != row['CFOP_Saida_Correto']:
                     motivo_erro.append(f"CFOP Divergente (Emitido: {row['CFOP_Emitido']} | Esperado: {row['CFOP_Saida_Correto']})")
                 if row['CST_PIS_Emitido'] != row['CST_PIS_Correto']:
                     motivo_erro.append(f"CST PIS Incorreto (Emitido: {row['CST_PIS_Emitido']} | Esperado: {row['CST_PIS_Correto']})")
             
-            # SE O NCM NÃO ESTÁ CADASTRADO: Faz validação lógica estrutural (Evita dar tela vazia)
+            # SE O NCM NÃO ESTÁ CADASTRADO: Faz validação lógica estrutural
             else:
-                # Regra Geral: Se o CFOP indica substituição tributária (Ex: 5405, 5403), o CST de ICMS não pode ser 000 (Tributação Normal)
+                # Inconsistência de ICMS ST genérica
                 if row['CFOP_Emitido'] in ['5403', '5405'] and row['CST_ICMS_Emitido'] in ['00', '000']:
-                    motivo_erro.append(f"Inconsistência ICMS ST: CFOP {row['CFOP_Emitido']} exige CST de ST (Ex: 10, 30, 60, 70), mas foi emitido CST {row['CST_ICMS_Emitido']}.")
+                    motivo_erro.append(f"Inconsistência ICMS ST: CFOP {row['CFOP_Emitido']} exige CST de ST, mas foi emitido CST {row['CST_ICMS_Emitido']}.")
                 
-                # Inconsistência de PIS para Monofásicos presumidos por CST
+                # Inconsistência de PIS Monofásico genérica
                 if row['CST_PIS_Emitido'] == '04' and row['CFOP_Emitido'] == '5102':
                     motivo_erro.append("Alerta de Operação: Produto emitido com PIS Monofásico (CST 04), mas utilizando CFOP de tributação normal (5102).")
             
-            # Se encontrou qualquer inconformidade ou para fins de exibição total, joga na lista
             if motivo_erro:
                 erros_encontrados.append({
                     "Arquivo": row['Arquivo'], "Item": row['Item'], "Produto": row['Descrição'],
@@ -156,20 +154,18 @@ if arquivos_carregados:
             idx_escolhido = opcoes_selecao[item_selecionado]
             dados_item = df_auditado.loc[idx_escolhido]
             
-            # Se o NCM não possui ficha completa cadastrada na base mock, monta uma ficha informativa dinâmica
             if pd.isna(dados_item['Regime_ICMS']):
                 st.warning(f"📋 Ficha Fiscal Gerada via Análise Lógica para o NCM: {dados_item['NCM']}")
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown("#### 📥 OPERAÇÃO DO PRODUTO")
-                    st.write(f"**CFOP Atual Emitted:** {dados_item['CFOP_Emitido']}")
+                    st.write(f"**CFOP Atual Emitido:** {dados_item['CFOP_Emitido']}")
                     st.write(f"**CST ICMS:** {dados_item['CST_ICMS_Emitido']}")
                 with col2:
                     st.markdown("#### 📦 IMPOSTOS FEDERAIS")
                     st.write(f"**CST PIS Emitido:** {dados_item['CST_PIS_Emitido']}")
                     st.write("Verifique as tabelas 4.3.10 e 4.3.11 do SPED para confirmar o enquadramento deste NCM no regime Monofásico.")
             else:
-                # Renderiza layout completo cadastrado
                 st.markdown(f"### 📋 Ficha Fiscal Completa - NCM {dados_item['NCM']}")
                 st.info(f"**Produto:** {dados_item['Descrição']} | **Classificação:** {dados_item['Descricao_NCM']}")
                 
@@ -183,3 +179,6 @@ if arquivos_carregados:
                     
                 st.error(f"⚠️ **Alertas Tributários**\n\n{dados_item['Alertas']}")
         else:
+            st.success("🎉 Análise em lote concluída! Nenhuma quebra de validação crítica encontrada nos seus XMLs.")
+            st.subheader("Lista de Itens Lidos com Sucesso")
+            st.dataframe(df_xml, use_container_width=True)
