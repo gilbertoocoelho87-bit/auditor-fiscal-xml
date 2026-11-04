@@ -1,201 +1,257 @@
 # -*- coding: utf-8 -*-
 """
-AUDITOR FISCAL DE XML (NF-e) - em lote
---------------------------------------
-Funcionalidades
-  1. Análise em lote de XMLs de NF-e/NFC-e (upload múltiplo ou .zip)
-  2. Conferência por NCM de:
-       - Substituição Tributária (ST) por UF  (base CSV: dados/st_base.csv)
-       - Produtos monofásicos (Tabelas 4.3.10 e 4.3.11 do SPED Contribuições)
-                                              (base CSV: dados/monofasico.csv)
-       - CFOP x CST/CSOSN x UF destino, alíquota de ICMS, PIS/COFINS, IPI
-  3. Mostra o ERRO de emissão, o valor CORRETO e a LEGISLAÇÃO
-  4. Consulta por NCM no formato "ficha" (estilo Econet)
-  5. Exporta o resultado em Excel e PDF
+AUDITOR FISCAL DE XML (NF-e) com IA  -  empresas do SIMPLES NACIONAL
+--------------------------------------------------------------------
+Fluxo:
+  1. Você envia os XMLs (ou um ZIP) e escolhe a UF da ST.
+  2. Para cada NCM x UF o app consulta a IA (Claude + busca na web em fontes
+     oficiais: Confaz, Receita/SPED, SEFAZ, Planalto) e obtém:
+       - se o NCM tem ICMS-ST na UF, CEST, segmento, MVA e a legislação
+       - se é monofásico (Tabelas 4.3.10 / 4.3.11 do SPED) e a legislação
+       - alíquota/legislação de IPI (TIPI)
+  3. O app compara com o XML, aponta o ERRO e já informa o CORRETO + legislação.
+  4. Fecha com o resumo de ST, Monofásico e Tributado (tela, Excel e PDF).
 
-IMPORTANTE
-  As bases embutidas abaixo são SEMENTES (exemplos por prefixo de NCM).
-  Para cobertura completa, importe as bases oficiais pela barra lateral:
-    - Tabelas 4.3.10 / 4.3.11: baixe no portal do SPED (Receita Federal)
-    - ST: Convênio ICMS 142/2018 (CEST) + protocolos/anexos de cada UF
-  Colunas esperadas nos CSVs estão descritas na aba "Bases de dados".
+Configuração (uma vez só):  ANTHROPIC_API_KEY em  Settings > Secrets  (Streamlit
+Cloud)  ou em  .streamlit/secrets.toml  (local).  Modelo opcional: ANTHROPIC_MODEL.
 """
 
 import io
+import json
 import os
+import re
+import time
 import zipfile
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Auditor Fiscal XML", page_icon="🧾", layout="wide")
 
-DADOS_DIR = "dados"
+CACHE_PATH = os.path.join("dados", "cache_ia.json")
+CACHE_DIAS = 30
+LOTE = 5            # NCMs por consulta à IA
+MODELO_PADRAO = "claude-sonnet-5-5"
 
-# ---------------------------------------------------------------------------
-# 1) TABELAS DE REFERÊNCIA
-# ---------------------------------------------------------------------------
 UFS = ["AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT",
        "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
-
-# Alíquota modal interna (sem FECP). CONFIRA a vigência - altere conforme necessário.
-ALIQ_INTERNA = {
-    "AC": 19, "AL": 20, "AM": 20, "AP": 18, "BA": 20.5, "CE": 20, "DF": 20, "ES": 17,
-    "GO": 19, "MA": 22, "MG": 18, "MS": 17, "MT": 17, "PA": 19, "PB": 20, "PE": 20.5,
-    "PI": 21, "PR": 19.5, "RJ": 20, "RN": 20, "RO": 19.5, "RR": 20, "RS": 17, "SC": 17,
-    "SE": 19, "SP": 18, "TO": 20,
-}
-SUL_SUDESTE_SEM_ES = {"SP", "RJ", "MG", "PR", "SC", "RS"}
+AUTO = "Automático (UF do destinatário)"
 
 RICMS = {
-    "PE": "RICMS/PE - Decreto nº 44.650/2017",
-    "SP": "RICMS/SP - Decreto nº 45.490/2000",
-    "RJ": "RICMS/RJ - Decreto nº 27.427/2000",
-    "BA": "RICMS/BA - Decreto nº 13.780/2012",
-    "CE": "RICMS/CE - Decreto nº 24.569/1997",
-    "PR": "RICMS/PR - Decreto nº 7.871/2017",
-    "RS": "RICMS/RS - Decreto nº 37.699/1997",
-    "MG": "RICMS/MG - Decreto nº 48.589/2023",
+    "PE": "RICMS/PE - Decreto nº 44.650/2017", "SP": "RICMS/SP - Decreto nº 45.490/2000",
+    "RJ": "RICMS/RJ - Decreto nº 27.427/2000", "BA": "RICMS/BA - Decreto nº 13.780/2012",
+    "CE": "RICMS/CE - Decreto nº 24.569/1997", "PR": "RICMS/PR - Decreto nº 7.871/2017",
+    "RS": "RICMS/RS - Decreto nº 37.699/1997", "MG": "RICMS/MG - Decreto nº 48.589/2023",
 }
+
 
 def ricms(uf):
-    return RICMS.get(uf, f"RICMS/{uf} (consultar legislação estadual vigente)")
-
-# Sementes (prefixos de NCM). Substitua pelas bases oficiais via upload.
-MONOFASICO_SEED = pd.DataFrame([
-    # tabela, prefixo NCM, descrição, legislação
-    ("4.3.10", "3003", "Medicamentos", "Lei 10.147/2000, art. 1º, I"),
-    ("4.3.10", "3004", "Medicamentos", "Lei 10.147/2000, art. 1º, I"),
-    ("4.3.10", "3303", "Perfumes e águas-de-colônia", "Lei 10.147/2000, art. 1º, II"),
-    ("4.3.10", "3304", "Produtos de beleza/maquilagem", "Lei 10.147/2000, art. 1º, II"),
-    ("4.3.10", "3305", "Preparações capilares", "Lei 10.147/2000, art. 1º, II"),
-    ("4.3.10", "3307", "Desodorantes/outros de perfumaria", "Lei 10.147/2000, art. 1º, II"),
-    ("4.3.10", "34011", "Sabonetes", "Lei 10.147/2000, art. 1º, II"),
-    ("4.3.10", "960321", "Escovas de dentes", "Lei 10.147/2000, art. 1º, II"),
-    ("4.3.10", "3306", "Higiene bucal", "Lei 10.147/2000, art. 1º, II"),
-    ("4.3.10", "4011", "Pneus novos", "Lei 10.485/2002, art. 5º / Lei 10.865/2004"),
-    ("4.3.10", "4013", "Câmaras de ar", "Lei 10.485/2002, art. 5º / Lei 10.865/2004"),
-    ("4.3.10", "8702", "Veículos (ônibus)", "Lei 10.485/2002, art. 1º"),
-    ("4.3.10", "8703", "Automóveis", "Lei 10.485/2002, art. 1º"),
-    ("4.3.10", "8704", "Veículos de carga", "Lei 10.485/2002, art. 1º"),
-    ("4.3.10", "8711", "Motocicletas", "Lei 10.485/2002, art. 1º"),
-    ("4.3.10", "8708", "Autopeças (Anexos I/II)", "Lei 10.485/2002, art. 3º"),
-    ("4.3.10", "8714", "Partes de motos (Anexos I/II)", "Lei 10.485/2002, art. 3º"),
-    ("4.3.10", "2106906", "Preparações p/ elaboração de bebidas", "Lei 13.097/2015, arts. 14 a 20"),
-    ("4.3.10", "2201", "Águas minerais/gaseificadas", "Lei 13.097/2015, arts. 14 a 20"),
-    ("4.3.10", "2202", "Refrigerantes/bebidas não alcoólicas", "Lei 13.097/2015, arts. 14 a 20"),
-    ("4.3.10", "2203", "Cervejas de malte", "Lei 13.097/2015, arts. 14 a 20"),
-    ("4.3.11", "2710", "Gasolina/diesel/óleos (combustíveis)", "Lei 9.718/1998, art. 4º; Lei 9.990/2000"),
-    ("4.3.11", "2711", "GLP/gás natural", "Lei 9.718/1998, art. 4º; Lei 11.909/2009"),
-    ("4.3.11", "2207", "Etanol", "Lei 9.718/1998, art. 5º; Lei 11.727/2008"),
-    ("4.3.11", "3826", "Biodiesel", "Lei 11.116/2005"),
-], columns=["tabela", "ncm_prefixo", "descricao", "legislacao"])
-
-_SEGMENTOS_ST = {
-    "01 Autopeças": ["8708", "8409", "8483", "8511", "8512", "8714", "7007", "8707", "842123", "842131"],
-    "02 Bebidas alcoólicas (exceto cerveja e chope)": ["2204", "2205", "2206", "2208"],
-    "03 Cervejas, chopes, refrigerantes, águas e outras bebidas": ["2201", "2202", "2203", "2106906"],
-    "04 Cigarros e outros derivados do fumo": ["2402", "2403"],
-    "05 Cimentos": ["2523"],
-    "06 Combustíveis e lubrificantes": ["2710", "2711", "2207", "3403", "3811", "3819"],
-    "08 Ferramentas": ["8201", "8202", "8203", "8204", "8205", "8206", "8207", "8208", "8467"],
-    "09 Lâmpadas, reatores e starter": ["8539", "850410"],
-    "10 Materiais de construção e congêneres": ["3214", "3506", "3816", "3917", "3918", "3922", "3925",
-                                                "4410", "4411", "4412", "4418", "6802", "6810", "6907",
-                                                "6908", "6910", "7003", "7004", "7005", "7308", "7317",
-                                                "7318", "7610", "8301", "8302", "8481", "9406"],
-    "11 Materiais de limpeza": ["2828", "3401", "3402", "3405", "380894", "9603"],
-    "12 Materiais elétricos": ["8535", "8536", "8537", "8538", "8544", "8545", "8546", "8547"],
-    "13 Medicamentos de uso humano": ["3001", "3002", "3003", "3004", "3005", "3006"],
-    "14 Papéis": ["4802", "4810", "4818", "4819", "4823"],
-    "15 Pneumáticos": ["4011", "4012", "4013"],
-    "16 Produtos alimentícios": ["1704", "1806", "1902", "1905"],
-    "17 Eletrônicos, eletroeletrônicos e eletrodomésticos": ["8471", "8517", "8518", "8519", "8521", "8525",
-                                                             "8527", "8528", "8506", "8507", "8509", "8516"],
-    "18 Produtos de papelaria": ["4817", "4820", "9608", "9609", "3213"],
-    "19 Perfumaria e higiene pessoal": ["3303", "3304", "3305", "3306", "3307", "340111", "960321"],
-    "21 Rações para animais": ["2309"],
-    "22 Sorvetes": ["2105"],
-    "23 Tintas e vernizes": ["3208", "3209", "3210", "3212"],
-    "24 Veículos automotores": ["8701", "8702", "8703", "8704", "8705", "8706"],
-    "25 Veículos de duas e três rodas": ["8711"],
-}
-ST_SEED = pd.DataFrame(
-    [("*", ncm, seg, "", f"Convênio ICMS 142/2018 - Segmento {seg}")
-     for seg, ncms in _SEGMENTOS_ST.items() for ncm in ncms],
-    columns=["uf", "ncm_prefixo", "segmento", "mva", "legislacao"])
-
-
-def _ler_csv(nome, seed):
-    caminho = os.path.join(DADOS_DIR, nome)
-    if os.path.exists(caminho):
-        try:
-            return pd.read_csv(caminho, dtype=str, sep=None, engine="python").fillna("")
-        except Exception:
-            pass
-    return seed.copy()
-
-
-@st.cache_data
-def carregar_bases():
-    return _ler_csv("monofasico.csv", MONOFASICO_SEED), _ler_csv("st_base.csv", ST_SEED)
-
-
-if "mono" not in st.session_state:
-    st.session_state["mono"], st.session_state["st"] = carregar_bases()
+    return RICMS.get(uf, f"RICMS/{uf}")
 
 
 def so_digitos(v):
     return "".join(c for c in str(v or "") if c.isdigit())
 
 
-def buscar_mono(ncm):
-    ncm = so_digitos(ncm)
-    df = st.session_state["mono"]
-    for _, r in df.iterrows():
-        p = so_digitos(r["ncm_prefixo"])
-        if p and ncm.startswith(p):
-            return r
-    return None
+# ---------------------------------------------------------------------------
+# 1) IA: classificação por NCM x UF (com busca na web)
+# ---------------------------------------------------------------------------
+def get_key():
+    try:
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("ANTHROPIC_API_KEY", "")
 
 
-def buscar_st(ncm, uf):
-    ncm = so_digitos(ncm)
-    df = st.session_state["st"]
-    so_uf = st.session_state.get("so_base_uf", False)
-    achados = []
-    for _, r in df.iterrows():
-        p = so_digitos(r["ncm_prefixo"])
-        if not (p and ncm.startswith(p)):
+def get_modelo():
+    try:
+        if "ANTHROPIC_MODEL" in st.secrets:
+            return st.secrets["ANTHROPIC_MODEL"]
+    except Exception:
+        pass
+    return os.environ.get("ANTHROPIC_MODEL", MODELO_PADRAO)
+
+
+SISTEMA = """Você é um especialista tributário brasileiro (ICMS-ST, PIS/COFINS monofásico, IPI, SPED).
+Hoje é {hoje}. Use a ferramenta de busca na web para confirmar a legislação VIGENTE em fontes oficiais
+(Confaz - Convênio ICMS 142/2018 e protocolos, SEFAZ da UF e seu RICMS, Receita Federal/portal SPED
+Tabelas 4.3.10 e 4.3.11, Planalto, TIPI). Seja DEFINITIVO: cada campo booleano é true ou false, sem
+'talvez' e sem 'verificar'. Responda SOMENTE com JSON válido, sem texto antes ou depois."""
+
+PROMPT = """UF da legislação de ST: {uf}
+Perfil do emitente: empresa do Simples Nacional que REVENDE mercadoria adquirida de terceiros.
+NCMs (8 dígitos): {ncms}
+
+Retorne uma LISTA JSON com um objeto por NCM, na mesma ordem, com exatamente estas chaves:
+{{
+ "ncm": "8 dígitos",
+ "descricao": "descrição curta do produto/NCM",
+ "st": true|false,                 // o NCM está sujeito a ICMS-ST na UF {uf} (revenda)
+ "segmento": "segmento do Convênio ICMS 142/2018 ou \\"\\"",
+ "cest": "CEST do item no formato 00.000.00 ou \\"\\"",
+ "mva": "MVA/base de cálculo da ST na UF ou \\"\\"",
+ "legislacao_st": "norma + artigo/anexo/item que sustenta a resposta (inclusive quando for false: onde a UF define)",
+ "monofasico": true|false,         // consta nas Tabelas 4.3.10 ou 4.3.11 do SPED Contribuições
+ "tabela_sped": "4.3.10" | "4.3.11" | "",
+ "legislacao_pis_cofins": "lei/artigo que sustenta (monofásico ou tributação normal)",
+ "ipi_aliquota": "alíquota da TIPI (ex.: 5%) ou NT",
+ "ipi_legislacao": "TIPI vigente / decreto",
+ "fontes": ["urls oficiais consultadas"]
+}}"""
+
+
+def _extrair_json(texto):
+    texto = texto.strip()
+    texto = re.sub(r"^```(?:json)?|```$", "", texto, flags=re.M).strip()
+    i, j = texto.find("["), texto.rfind("]")
+    if i != -1 and j > i:
+        return json.loads(texto[i:j + 1])
+    i, j = texto.find("{"), texto.rfind("}")
+    return [json.loads(texto[i:j + 1])]
+
+
+def _chamar_ia(ncms, uf, chave, modelo):
+    """Uma consulta (lote de NCMs) com busca na web. Sem uso de st.* (roda em thread)."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=chave)
+    mensagens = [{"role": "user", "content": PROMPT.format(uf=uf, ncms=", ".join(ncms))}]
+    for _ in range(4):
+        msg = client.messages.create(
+            model=modelo, max_tokens=6000,
+            system=SISTEMA.format(hoje=date.today().strftime("%d/%m/%Y")),
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+            messages=mensagens)
+        if msg.stop_reason == "pause_turn":
+            mensagens.append({"role": "assistant", "content": msg.content})
             continue
-        if r["uf"] == uf or (not so_uf and r["uf"] in ("*", "")):
-            achados.append((0 if r["uf"] == uf else 1, -len(p), r))
-    achados.sort(key=lambda x: (x[0], x[1]))
-    return achados[0][2] if achados else None
+        break
+    texto = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    return _extrair_json(texto)
 
 
-def uf_da_st(nota):
-    esc = st.session_state.get("uf_st", "")
-    return esc if esc in UFS else (nota["dest_uf"] or nota["emit_uf"])
+def _bool(v):
+    return v is True or str(v).strip().lower() in ("true", "sim", "s", "1")
 
 
-def normaliza_st(df):
-    """Aceita lista oficial de uma UF (só NCM, ou NCM+CEST) e completa as colunas."""
-    df = df.copy()
-    df.columns = [c.strip().lower() for c in df.columns]
-    for alt in ("ncm", "ncm/sh", "ncm_sh"):
-        if alt in df.columns and "ncm_prefixo" not in df.columns:
-            df = df.rename(columns={alt: "ncm_prefixo"})
-    uf_esc = st.session_state.get("uf_st", "")
-    if "uf" not in df.columns:
-        df["uf"] = uf_esc if uf_esc in UFS else "*"
-    for c in ("segmento", "mva", "legislacao"):
-        if c not in df.columns:
-            df[c] = ""
-    df["ncm_prefixo"] = df["ncm_prefixo"].map(so_digitos)
-    df["legislacao"] = [l or f"Lista de ST importada - {ricms(u)}" for l, u in zip(df["legislacao"], df["uf"])]
-    return df.fillna("")
+def _normalizar(d, ncm, origem):
+    fontes = d.get("fontes") or []
+    if isinstance(fontes, str):
+        fontes = [fontes]
+    return {
+        "ncm": ncm, "descricao": str(d.get("descricao", ""))[:120],
+        "st": _bool(d.get("st")), "segmento": str(d.get("segmento", "")),
+        "cest": str(d.get("cest", "")), "mva": str(d.get("mva", "")),
+        "legislacao_st": str(d.get("legislacao_st", "")),
+        "monofasico": _bool(d.get("monofasico")), "tabela_sped": str(d.get("tabela_sped", "")),
+        "legislacao_pis_cofins": str(d.get("legislacao_pis_cofins", "")),
+        "ipi_aliquota": str(d.get("ipi_aliquota", "")), "ipi_legislacao": str(d.get("ipi_legislacao", "")),
+        "fontes": [str(f) for f in fontes][:3], "origem": origem, "ts": time.time(),
+    }
+
+
+# --- base interna (reserva, só usada se a IA estiver indisponível) -----------
+_ST_INTERNA = {
+    "01 Autopeças": ["8708", "8409", "8483", "8511", "8512", "8714", "7007", "8707"],
+    "03 Bebidas": ["2201", "2202", "2203", "2106906"], "05 Cimentos": ["2523"],
+    "08 Ferramentas": ["8201", "8202", "8203", "8204", "8205", "8206", "8207", "8208"],
+    "10 Materiais de construção": ["3917", "3925", "3506", "3214", "4418", "6907", "7318", "8302"],
+    "11 Material de limpeza": ["2828", "3401", "3402", "380894"],
+    "12 Materiais elétricos": ["8535", "8536", "8537", "8538", "8544"],
+    "13 Medicamentos": ["3003", "3004"], "15 Pneumáticos": ["4011", "4012", "4013"],
+    "19 Perfumaria e higiene": ["3303", "3304", "3305", "3306", "3307", "340111"],
+    "23 Tintas e vernizes": ["3208", "3209", "3210"],
+}
+_MONO_INTERNA = {
+    "3003": "Lei 10.147/2000", "3004": "Lei 10.147/2000", "3303": "Lei 10.147/2000",
+    "3304": "Lei 10.147/2000", "3305": "Lei 10.147/2000", "3307": "Lei 10.147/2000",
+    "3306": "Lei 10.147/2000", "340111": "Lei 10.147/2000", "4011": "Lei 10.485/2002",
+    "4013": "Lei 10.485/2002", "8708": "Lei 10.485/2002", "8714": "Lei 10.485/2002",
+    "8703": "Lei 10.485/2002", "8711": "Lei 10.485/2002", "2202": "Lei 13.097/2015",
+    "2203": "Lei 13.097/2015", "2201": "Lei 13.097/2015", "2710": "Lei 9.718/1998",
+}
+
+
+def info_interna(ncm, uf):
+    seg = next((s for s, l in _ST_INTERNA.items() if any(ncm.startswith(p) for p in l)), "")
+    leg_m = next((v for p, v in _MONO_INTERNA.items() if ncm.startswith(p)), "")
+    d = {"descricao": "", "st": bool(seg), "segmento": seg, "cest": "", "mva": "",
+         "legislacao_st": f"Convênio ICMS 142/2018 - segmento {seg}" if seg else f"{ricms(uf)}",
+         "monofasico": bool(leg_m), "tabela_sped": "4.3.10" if leg_m else "",
+         "legislacao_pis_cofins": leg_m or "Leis 10.637/2002 e 10.833/2003", "ipi_aliquota": "", "ipi_legislacao": "",
+         "fontes": []}
+    return _normalizar(d, ncm, "base interna (IA indisponível)")
+
+
+def _ler_cache():
+    try:
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _salvar_cache(c):
+    try:
+        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(c, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def obter_infos(pares):
+    """pares: conjunto de (uf, ncm). Retorna ({(uf, ncm): info}, [avisos])."""
+    cache = _ler_cache()
+    infos, avisos, pendentes = {}, [], {}
+    limite = time.time() - CACHE_DIAS * 86400
+    for uf, ncm in pares:
+        c = cache.get(f"{uf}|{ncm}")
+        if c and c.get("ts", 0) > limite and not c["origem"].startswith("base interna"):
+            infos[(uf, ncm)] = c
+        else:
+            pendentes.setdefault(uf, []).append(ncm)
+
+    chave, modelo = get_key(), get_modelo()
+    tarefas = [(uf, ncms[i:i + LOTE]) for uf, ncms in pendentes.items() for i in range(0, len(ncms), LOTE)]
+
+    def rodar(t):
+        uf, lote = t
+        for tentativa in range(2):
+            try:
+                return t, _chamar_ia(lote, uf, chave, modelo), None
+            except Exception as e:  # noqa
+                erro = str(e)[:200]
+                time.sleep(2)
+        return t, None, erro
+
+    if tarefas and chave:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            resultados = list(ex.map(rodar, tarefas))
+    else:
+        resultados = [(t, None, "chave da API não configurada") for t in tarefas]
+
+    for (uf, lote), lista, erro in resultados:
+        por_ncm = {}
+        if lista:
+            for pos, d in enumerate(lista):
+                n = so_digitos(d.get("ncm", "")) or (lote[pos] if pos < len(lote) else "")
+                por_ncm[n] = d
+        for ncm in lote:
+            if ncm in por_ncm:
+                info = _normalizar(por_ncm[ncm], ncm, "IA + busca web")
+                cache[f"{uf}|{ncm}"] = info
+            else:
+                info = info_interna(ncm, uf)
+            infos[(uf, ncm)] = info
+        if erro:
+            avisos.append(f"UF {uf}, NCMs {', '.join(lote)}: {erro}")
+    _salvar_cache(cache)
+    return infos, avisos
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +262,6 @@ def _tag(el):
 
 
 def _find(el, path):
-    """Busca ignorando namespace. path = 'a/b/c'."""
     atual = [el]
     for parte in path.split("/"):
         prox = []
@@ -230,203 +285,130 @@ def _num(el, path):
         return 0.0
 
 
+def _grupo(pai, nome):
+    g = _find(pai, nome) if pai is not None else None
+    if g is not None and len(g):
+        return list(g)[0]
+    return None
+
+
 def parse_nfe(conteudo, nome):
     root = ET.fromstring(conteudo)
-    inf = None
-    for e in root.iter():
-        if _tag(e) == "infNFe":
-            inf = e
-            break
+    inf = next((e for e in root.iter() if _tag(e) == "infNFe"), None)
     if inf is None:
         raise ValueError("Não é um XML de NF-e/NFC-e (infNFe não encontrado).")
     nota = {
-        "arquivo": nome,
-        "chave": inf.attrib.get("Id", "")[3:],
-        "numero": _txt(inf, "ide/nNF"),
-        "serie": _txt(inf, "ide/serie"),
-        "emissao": _txt(inf, "ide/dhEmi") or _txt(inf, "ide/dEmi"),
-        "tpNF": _txt(inf, "ide/tpNF"),
-        "idDest": _txt(inf, "ide/idDest"),
-        "emit_cnpj": _txt(inf, "emit/CNPJ"),
-        "emit_nome": _txt(inf, "emit/xNome"),
-        "emit_uf": _txt(inf, "emit/enderEmit/UF"),
-        "crt": _txt(inf, "emit/CRT"),
+        "arquivo": nome, "chave": inf.attrib.get("Id", "")[3:], "numero": _txt(inf, "ide/nNF"),
+        "serie": _txt(inf, "ide/serie"), "idDest": _txt(inf, "ide/idDest"),
+        "emit_uf": _txt(inf, "emit/enderEmit/UF"), "crt": _txt(inf, "emit/CRT"),
         "dest_uf": _txt(inf, "dest/enderDest/UF"),
-        "dest_ie": _txt(inf, "dest/indIEDest"),
     }
     itens = []
     for det in [c for c in inf if _tag(c) == "det"]:
-        prod = _find(det, "prod")
-        imp = _find(det, "imposto")
-        icms_grp = None
-        icms = _find(imp, "ICMS")
-        if icms is not None and len(icms):
-            icms_grp = list(icms)[0]
-        pis_grp = None
-        pis = _find(imp, "PIS")
-        if pis is not None and len(pis):
-            pis_grp = list(pis)[0]
-        cof_grp = None
-        cof = _find(imp, "COFINS")
-        if cof is not None and len(cof):
-            cof_grp = list(cof)[0]
-        ipi = _find(imp, "IPI")
-        ipi_grp = None
-        if ipi is not None:
-            for c in ipi:
-                if _tag(c) in ("IPITrib", "IPINT"):
-                    ipi_grp = c
+        prod, imp = _find(det, "prod"), _find(det, "imposto")
+        icms, pis, cof = _grupo(imp, "ICMS"), _grupo(imp, "PIS"), _grupo(imp, "COFINS")
         itens.append({
-            "item": det.attrib.get("nItem", ""),
-            "cProd": _txt(prod, "cProd"),
-            "xProd": _txt(prod, "xProd"),
-            "ncm": so_digitos(_txt(prod, "NCM")),
-            "cest": _txt(prod, "CEST"),
-            "cfop": _txt(prod, "CFOP"),
-            "vProd": _num(prod, "vProd"),
-            "orig": _txt(icms_grp, "orig"),
-            "cst_icms": _txt(icms_grp, "CST") or _txt(icms_grp, "CSOSN"),
-            "pICMS": _num(icms_grp, "pICMS"),
-            "vICMS": _num(icms_grp, "vICMS"),
-            "vICMSST": _num(icms_grp, "vICMSST"),
-            "vBCST": _num(icms_grp, "vBCST"),
-            "cst_pis": _txt(pis_grp, "CST"),
-            "pPIS": _num(pis_grp, "pPIS"),
-            "vPIS": _num(pis_grp, "vPIS"),
-            "cst_cofins": _txt(cof_grp, "CST"),
-            "pCOFINS": _num(cof_grp, "pCOFINS"),
-            "vCOFINS": _num(cof_grp, "vCOFINS"),
-            "cst_ipi": _txt(ipi_grp, "CST"),
-            "pIPI": _num(ipi_grp, "pIPI"),
+            "item": det.attrib.get("nItem", ""), "xProd": _txt(prod, "xProd"),
+            "ncm": so_digitos(_txt(prod, "NCM")), "cest": _txt(prod, "CEST"),
+            "cfop": _txt(prod, "CFOP"), "vProd": _num(prod, "vProd"),
+            "cst_icms": _txt(icms, "CSOSN") or _txt(icms, "CST"), "vICMSST": _num(icms, "vICMSST"),
+            "cst_pis": _txt(pis, "CST"), "vPIS": _num(pis, "vPIS"),
+            "cst_cofins": _txt(cof, "CST"), "vCOFINS": _num(cof, "vCOFINS"),
         })
     return nota, itens
 
 
 # ---------------------------------------------------------------------------
-# 3) MOTOR DE REGRAS
+# 3) MOTOR DE REGRAS (Simples Nacional)  -  o "correto" vem da IA + regra fixa
 # ---------------------------------------------------------------------------
-CST_ST = {"10", "30", "70", "201", "202", "203"}
-CST_ST_RETIDA = {"60", "500"}
-CST_TRIBUTADO_INTEGRAL = {"00", "20", "101", "102", "103", "900"}
+CSOSN_ST_SUBST = {"201", "202", "203"}
+CSOSN_ST_RETIDA = {"500"}
 CFOP_ST_SUBST = {"5401", "5403", "6401", "6403"}
 CFOP_ST_RETIDA = {"5405", "6404"}
 
 
-def aliq_interestadual(uf_o, uf_d, orig):
-    if orig in ("1", "2", "3", "8"):
-        return 4.0
-    if uf_o in SUL_SUDESTE_SEM_ES and uf_d not in SUL_SUDESTE_SEM_ES:
-        return 7.0
-    return 12.0
+def uf_da_st(nota):
+    esc = st.session_state.get("uf_st", AUTO)
+    return esc if esc in UFS else (nota["dest_uf"] or nota["emit_uf"])
 
 
-def aliq_esperada(uf_o, uf_d, orig):
-    if uf_o == uf_d:
-        return float(ALIQ_INTERNA.get(uf_o, 0))
-    return aliq_interestadual(uf_o, uf_d, orig)
+def _fonte(info):
+    f = info["origem"]
+    return f + (" | " + "; ".join(info["fontes"][:2]) if info["fontes"] else "")
 
 
-def aliq_pc_correta():
-    reg = st.session_state.get("regime_pc", "Cumulativo (Lucro Presumido)")
-    return (0.65, 3.0) if reg.startswith("Cumulativo") else (1.65, 7.6)
-
-
-def auditar_item(nota, it):
+def auditar_item(nota, it, info, uf_st):
     erros = []
     uf_o, uf_d = nota["emit_uf"], nota["dest_uf"] or nota["emit_uf"]
-    simples = True  # análise SEMPRE para empresas do Simples Nacional
-    cst, cf = it["cst_icms"], it["cfop"]
     interna = uf_o == uf_d
+    cst, cf = it["cst_icms"], it["cfop"]
 
     def add(campo, informado, correto, leg):
         erros.append({
-            "Nota": nota["numero"], "Série": nota["serie"], "Item": it["item"],
-            "Produto": it["xProd"][:60], "NCM": it["ncm"], "Campo": campo,
-            "Informado": informado, "Correto": correto, "Gravidade": "ERRO",
-            "Legislação": leg, "Arquivo": nota["arquivo"], "Chave": nota["chave"],
+            "Nota": nota["numero"], "Série": nota["serie"], "Item": it["item"], "Produto": it["xProd"][:60],
+            "NCM": it["ncm"], "Campo": campo, "Informado": informado, "Correto": correto,
+            "Legislação": leg, "Fonte": _fonte(info), "Arquivo": nota["arquivo"], "Chave": nota["chave"],
         })
 
     if nota["crt"] not in ("1", "2") and it["item"] in ("1", ""):
         add("CRT", nota["crt"] or "(vazio)", "1 - Simples Nacional (ou 2 - excesso de sublimite)",
             "LC 123/2006; leiaute NF-e (Ajuste SINIEF 07/2005)")
-
-    # --- NCM ---
     if len(it["ncm"]) != 8:
-        add("NCM", it["ncm"], "8 dígitos válidos (TIPI/NCM)", "Ajuste SINIEF 07/2005; Resolução Gecex vigente (NCM)")
-
-    # --- CFOP x UF ---
+        add("NCM", it["ncm"], "8 dígitos válidos (NCM/TIPI)", "Ajuste SINIEF 07/2005; Resolução Gecex vigente")
     if cf and cf[0] in "56":
         if interna and cf[0] != "5":
             add("CFOP", cf, "Iniciar com 5 (operação interna)", "Ajuste SINIEF 07/2001 (Tabela de CFOP)")
         elif not interna and cf[0] != "6":
             add("CFOP", cf, "Iniciar com 6 (operação interestadual)", "Ajuste SINIEF 07/2001 (Tabela de CFOP)")
 
-    # --- ICMS: ST x tributado normal (veredito pela base) ---
-    uf_st = uf_da_st(nota)
-    regra_st = buscar_st(it["ncm"], uf_st)
-    if regra_st is not None:
-        seg = regra_st["segmento"]
-        leg = f"{regra_st['legislacao']} | {ricms(uf_st)} | LC 87/1996, arts. 6º a 10"
-        if cst not in CST_ST | CST_ST_RETIDA:
-            add("CST/CSOSN ICMS", cst,
-                ("500" if simples else "60") + f" - ICMS-ST já retido na entrada (NCM do segmento {seg})", leg)
-        cf_ok = "5405" if interna else "6404"
-        if cst in CST_ST:
+    # ---- ICMS-ST ----
+    if info["st"]:
+        leg = f"{info['legislacao_st']} | {ricms(uf_st)}" + (f" | Segmento {info['segmento']}" if info["segmento"] else "")
+        if cst not in CSOSN_ST_SUBST | CSOSN_ST_RETIDA:
+            add("CSOSN ICMS", cst, f"500 - ICMS-ST já retido anteriormente (NCM com ST em {uf_st})", leg)
+        if cst in CSOSN_ST_SUBST:
             if cf not in CFOP_ST_SUBST:
                 add("CFOP", cf, "5403" if interna else "6403", leg)
-        elif cf != cf_ok:
-            add("CFOP", cf, cf_ok + " - revenda de mercadoria com ST já retida", leg)
-        if not it["cest"]:
-            add("CEST", "(vazio)", f"Informar o CEST do segmento {seg} (obrigatório para NCM sujeito à ST)",
-                "Convênio ICMS 142/2018, cláusula 1ª-A")
+        else:
+            cf_ok = "5405" if interna else "6404"
+            if cf != cf_ok:
+                add("CFOP", cf, f"{cf_ok} - revenda com ST já retida", leg)
+        cest_ok, cest_x = so_digitos(info["cest"]), so_digitos(it["cest"])
+        if cest_ok and cest_x != cest_ok:
+            add("CEST", it["cest"] or "(vazio)", info["cest"], leg)
+        elif not cest_ok and not cest_x:
+            add("CEST", "(vazio)", f"Informar o CEST do segmento {info['segmento']}", leg)
     else:
-        leg = f"{ricms(uf_st)} - NCM sem ST em {uf_st}"
-        if cst in CST_ST | CST_ST_RETIDA:
-            add("CST/CSOSN ICMS", cst, ("102" if simples else "00") + " - tributação normal (NCM sem ST)", leg)
+        leg = f"{info['legislacao_st'] or ricms(uf_st)} - NCM sem ST em {uf_st}"
+        if cst in CSOSN_ST_SUBST | CSOSN_ST_RETIDA:
+            add("CSOSN ICMS", cst, "102 - tributada sem permissão de crédito (NCM sem ST)", leg)
         if cf in CFOP_ST_SUBST | CFOP_ST_RETIDA:
             add("CFOP", cf, "5102" if interna else "6102", leg)
 
-    # --- Alíquota ICMS (regime normal, tributado) ---
-    if not simples and cst in {"00", "10", "20", "70"} and it["pICMS"]:
-        esperada = aliq_esperada(uf_o, uf_d, it["orig"])
-        if abs(it["pICMS"] - esperada) > 0.01:
-            base = ("Resolução do Senado nº 13/2012 (4%) e nº 22/1989 (7%/12%)" if not interna else ricms(uf_o))
-            add("Alíquota ICMS", f"{it['pICMS']:.2f}%", f"{esperada:.2f}%", base)
+    if len(cst) == 2 and not any(e["Campo"] == "CSOSN ICMS" for e in erros):
+        add("CST x CSOSN", cst, "Usar CSOSN (3 dígitos) - emitente do Simples Nacional",
+            "LC 123/2006; leiaute NF-e (Aj. SINIEF 07/2005)")
 
-    # --- PIS/COFINS: monofásico x tributado ---
-    mono = buscar_mono(it["ncm"])
-    if mono is not None:
-        leg = f"Tabela SPED {mono['tabela']} - {mono['descricao']} | {mono['legislacao']}"
+    # ---- PIS/COFINS ----
+    if info["monofasico"]:
+        leg = f"Tabela SPED {info['tabela_sped']} | {info['legislacao_pis_cofins']}"
         for tributo, cst_p, v in (("PIS", it["cst_pis"], it["vPIS"]), ("COFINS", it["cst_cofins"], it["vCOFINS"])):
             if cst_p != "04":
                 add(f"CST {tributo}", cst_p, "04 - Operação tributável monofásica (revenda a alíquota zero)", leg)
             if v and v > 0:
-                add(f"Valor {tributo}", f"{v:.2f}", "0,00 - já recolhido pelo fabricante/importador", leg)
+                add(f"Valor {tributo}", f"{v:.2f}", "0,00 - recolhido pelo fabricante/importador", leg)
     else:
-        leg = "Leis 9.718/1998, 10.637/2002 e 10.833/2003 - NCM fora das Tabelas 4.3.10/4.3.11"
         if it["cst_pis"] == "04" or it["cst_cofins"] == "04":
             add("CST PIS/COFINS", f"{it['cst_pis']}/{it['cst_cofins']}",
-                ("49" if simples else "01") + " - NCM não é monofásico: receita tributável", leg)
-        if not simples:
-            ap, ac = aliq_pc_correta()
-            if it["cst_pis"] == "01" and abs(it["pPIS"] - ap) > 0.001:
-                add("Alíquota PIS", f"{it['pPIS']:.2f}%", f"{ap:.2f}%", leg)
-            if it["cst_cofins"] == "01" and abs(it["pCOFINS"] - ac) > 0.001:
-                add("Alíquota COFINS", f"{it['pCOFINS']:.2f}%", f"{ac:.2f}%", leg)
-
-    # --- CRT x tipo de código ---
-    if simples and len(cst) == 2:
-        add("CRT x CST", cst, "Usar CSOSN (3 dígitos) - emitente do Simples Nacional", "LC 123/2006; leiaute NF-e (Aj. SINIEF 07/2005)")
-    if not simples and len(cst) == 3:
-        add("CRT x CSOSN", cst, "Usar CST (2 dígitos) - emitente do Regime Normal", "Leiaute NF-e (Aj. SINIEF 07/2005)")
+                "49 - Outras operações de saída (NCM não monofásico)",
+                f"{info['legislacao_pis_cofins']} | NCM fora das Tabelas 4.3.10/4.3.11 do SPED")
     return erros
 
 
-def classificar(nota, it):
-    e_st = buscar_st(it["ncm"], uf_da_st(nota)) is not None
-    e_mono = buscar_mono(it["ncm"]) is not None
+def classificar(nota, it, info):
     return {"nota": nota["numero"], "item": it["item"], "ncm": it["ncm"], "vProd": it["vProd"],
-            "vICMSST": it["vICMSST"], "vPISCOF": it["vPIS"] + it["vCOFINS"], "st": e_st, "mono": e_mono}
+            "vICMSST": it["vICMSST"], "vPISCOF": it["vPIS"] + it["vCOFINS"],
+            "st": info["st"], "mono": info["monofasico"]}
 
 
 def montar_resumo(it_df):
@@ -445,56 +427,32 @@ def montar_resumo(it_df):
                 "PIS+COFINS destacados (R$)": round(sub["vPISCOF"].sum(), 2)}
 
     todos = pd.Series(True, index=it_df.index)
-    linhas = [linha("SUBSTITUIÇÃO TRIBUTÁRIA (ICMS-ST)", it_df["st"]),
-              linha("MONOFÁSICO (PIS/COFINS)", it_df["mono"]),
-              linha("TRIBUTADO NORMAL (sem ST e sem monofásico)", ~it_df["st"] & ~it_df["mono"]),
-              linha("TOTAL GERAL DOS PRODUTOS", todos)]
-    return pd.DataFrame(linhas, columns=cols)
+    return pd.DataFrame([
+        linha("SUBSTITUIÇÃO TRIBUTÁRIA (ICMS-ST)", it_df["st"]),
+        linha("MONOFÁSICO (PIS/COFINS)", it_df["mono"]),
+        linha("TRIBUTADO NORMAL (sem ST e sem monofásico)", ~it_df["st"] & ~it_df["mono"]),
+        linha("TOTAL GERAL DOS PRODUTOS", todos)], columns=cols)
+
+
+def tabela_ncm(infos):
+    linhas = [{"UF": uf, "NCM": n, "Descrição": i["descricao"], "ICMS-ST": "SIM" if i["st"] else "NÃO",
+               "CEST": i["cest"], "Segmento": i["segmento"], "MVA": i["mva"], "Legislação ST": i["legislacao_st"],
+               "Monofásico": "SIM" if i["monofasico"] else "NÃO", "Tabela SPED": i["tabela_sped"],
+               "Legislação PIS/COFINS": i["legislacao_pis_cofins"], "IPI": i["ipi_aliquota"],
+               "Origem": i["origem"], "Fontes": " ; ".join(i["fontes"])}
+              for (uf, n), i in sorted(infos.items())]
+    return pd.DataFrame(linhas)
 
 
 # ---------------------------------------------------------------------------
-# 4) FICHA POR NCM (estilo Econet)
+# 4) EXPORTAÇÃO
 # ---------------------------------------------------------------------------
-def ficha_ncm(ncm, uf_o, uf_d, crt):
-    ncm = so_digitos(ncm)
-    mono = buscar_mono(ncm)
-    regra_st = buscar_st(ncm, uf_d)
-    simples = crt == "Simples Nacional"
-    interna = uf_o == uf_d
-
-    out = {"ncm": ncm}
-    # ICMS
-    if regra_st is not None:
-        out["cfop_saida"] = "5405 / 6404 (ST já retida)  |  5401/5403 / 6401/6403 (substituto)"
-        out["cst_icms"] = "500 / 201 / 202" if simples else "60 (ST retida) / 10 / 70"
-        out["icms_texto"] = f"Produto sujeito à ST ({regra_st['segmento']}). MVA/base: consultar anexo da UF."
-        out["icms_leg"] = f"{regra_st['legislacao']} | {ricms(uf_d)}"
-    else:
-        out["cfop_saida"] = "5102 (interna) / 6102 (interestadual)"
-        out["cst_icms"] = "102" if simples else "00 (tributada integralmente)"
-        out["icms_texto"] = "Tributação normal."
-        out["icms_leg"] = ricms(uf_o)
-    out["aliquota_icms"] = f"{aliq_esperada(uf_o, uf_d, '0'):.2f}%"
-    out["tipo_oper"] = "interna" if interna else "interestadual"
-    # PIS/COFINS
-    if mono is not None:
-        out["pis_cofins"] = "CST 04 - Monofásico (alíquota zero na revenda)"
-        out["pis_leg"] = f"Tabela SPED {mono['tabela']} - {mono['descricao']} | {mono['legislacao']}"
-    else:
-        out["pis_cofins"] = "CST 01 - Tributável (0,65%/3,00% cumulativo ou 1,65%/7,60% não cumulativo)"
-        out["pis_leg"] = "Leis 9.718/1998, 10.637/2002 e 10.833/2003"
-    out["ipi"] = "Consultar TIPI (Decreto 11.158/2022) para a alíquota do NCM"
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 5) EXPORTAÇÃO
-# ---------------------------------------------------------------------------
-def to_excel(df, resumo):
+def to_excel(df, resumo, ncms):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Inconsistências")
+        df.to_excel(w, index=False, sheet_name="Erros e correções")
         resumo.to_excel(w, index=False, sheet_name="Resumo ST-Mono-Tributado")
+        ncms.to_excel(w, index=False, sheet_name="Classificação por NCM")
         for ws in w.sheets.values():
             for col in ws.columns:
                 largura = max(len(str(c.value or "")) for c in col[:200]) + 2
@@ -510,125 +468,99 @@ def to_pdf(df, resumo):
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=20, rightMargin=20, topMargin=20, bottomMargin=20)
-    estilos = getSampleStyleSheet()
-    pequeno = estilos["BodyText"].clone("p")
-    pequeno.fontSize = 6.5
-    pequeno.leading = 8
-    elems = [Paragraph("Relatório de Inconsistências Fiscais - XML", estilos["Title"]), Spacer(1, 8)]
-    cols = ["Nota", "Item", "NCM", "Campo", "Informado", "Correto", "Gravidade", "Legislação"]
+    est = getSampleStyleSheet()
+    p = est["BodyText"].clone("p")
+    p.fontSize, p.leading = 6.5, 8
+    estilo = TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3a5f")),
+                         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTSIZE", (0, 0), (-1, 0), 7),
+                         ("GRID", (0, 0), (-1, -1), 0.25, colors.grey), ("VALIGN", (0, 0), (-1, -1), "TOP")])
+    cols = ["Nota", "Item", "NCM", "Campo", "Informado", "Correto", "Legislação"]
     df = df.reindex(columns=cols)
-    dados = [cols] + [[Paragraph(str(r[c]), pequeno) for c in cols] for _, r in df.iterrows()]
-    t = Table(dados, repeatRows=1, colWidths=[35, 25, 55, 70, 65, 170, 45, 280])
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3a5f")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTSIZE", (0, 0), (-1, 0), 7),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    elems.append(t)
-    elems += [Spacer(1, 14), Paragraph("Resumo final: ST, Monofásico e Tributado", estilos["Heading2"])]
-    rc = list(resumo.columns)
-    rd = [rc] + [[Paragraph(str(v), pequeno) for v in row] for row in resumo.values.tolist()]
+    dados = [cols] + [[Paragraph(str(r[c]), p) for c in cols] for _, r in df.iterrows()]
+    t = Table(dados, repeatRows=1, colWidths=[35, 25, 55, 70, 65, 220, 330])
+    t.setStyle(estilo)
+    elems = [Paragraph("Relatório de erros e correções - XML (Simples Nacional)", est["Title"]), Spacer(1, 8), t,
+             Spacer(1, 14), Paragraph("Resumo final: ST, Monofásico e Tributado", est["Heading2"])]
+    rd = [list(resumo.columns)] + [[Paragraph(str(v), p) for v in row] for row in resumo.values.tolist()]
     t2 = Table(rd, repeatRows=1, colWidths=[230, 40, 110, 55, 110, 120])
-    t2.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3a5f")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("FONTSIZE", (0, 0), (-1, 0), 7),
-    ]))
-    elems += [t2, Spacer(1, 6), Paragraph("Item com ST e monofásico aparece nas duas primeiras linhas (impostos distintos: ICMS e PIS/COFINS).", pequeno)]
+    t2.setStyle(estilo)
+    elems += [t2, Spacer(1, 6), Paragraph("Item com ST e monofásico aparece nas duas primeiras linhas (ICMS e PIS/COFINS são impostos distintos).", p)]
     doc.build(elems)
     return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
-# 6) INTERFACE
+# 5) INTERFACE (sem barra lateral)
 # ---------------------------------------------------------------------------
-st.title("🧾 Auditor Fiscal de XML")
-st.caption("Análise em lote de NF-e: ST por UF, monofásicos (SPED 4.3.10 / 4.3.11), CFOP, CST, alíquotas e legislação.")
+st.title("🧾 Auditor Fiscal de XML com IA")
+st.caption("Simples Nacional | ICMS-ST por UF | PIS/COFINS monofásico (SPED 4.3.10/4.3.11) | CFOP | CSOSN | legislação")
 
-with st.sidebar:
-    st.header("Bases de dados")
-    up_mono = st.file_uploader("Monofásicos (CSV)", type="csv", key="up_mono")
-    up_st = st.file_uploader("Base ST por UF (CSV)", type="csv", key="up_st")
-    if up_mono:
-        st.session_state["mono"] = pd.read_csv(up_mono, dtype=str, sep=None, engine="python").fillna("")
-        st.success(f"{len(st.session_state['mono'])} linhas de monofásicos carregadas")
-    if up_st:
-        novo_st = normaliza_st(pd.read_csv(up_st, dtype=str, sep=None, engine="python"))
-        base_st = st.session_state["st"].reindex(columns=list(novo_st.columns)).fillna("")
-        st.session_state["st"] = (pd.concat([base_st, novo_st], ignore_index=True)
-                                  .drop_duplicates(subset=["uf", "ncm_prefixo"], keep="last"))
-        st.success(f"{len(novo_st)} linhas de ST importadas (UF: {', '.join(sorted(set(novo_st['uf'])))})")
-    st.info(f"Monofásicos: {len(st.session_state['mono'])} regras\n\nST: {len(st.session_state['st'])} regras")
+if not get_key():
+    st.error("Chave da IA não configurada. Cadastre **ANTHROPIC_API_KEY** em Settings > Secrets (Streamlit Cloud) "
+             "ou em `.streamlit/secrets.toml`. Sem ela o app usa apenas uma base interna parcial.")
 
-aba1, aba2, aba3 = st.tabs(["📂 Análise em lote", "🔎 Consulta por NCM", "🗄️ Bases de dados"])
+aba1, aba2 = st.tabs(["📂 Análise em lote", "🔎 Consulta por NCM"])
 
-# ---- Aba 1 ----
 with aba1:
-    cA, cB = st.columns([1, 2])
-    cA.selectbox("UF da legislação de ST", ["Automático (UF do destinatário)"] + UFS, key="uf_st")
-    cB.checkbox("Usar somente os NCMs cadastrados para esta UF (ignorar a base nacional '*')", key="so_base_uf")
-    st.caption("Análise fixa para empresas do **Simples Nacional** (CSOSN). A UF escolhida define a lista de ST, "
-               "a legislação citada e o CFOP/CSOSN correto.")
-    _uf = st.session_state.get("uf_st", "")
-    if st.session_state.get("so_base_uf") and _uf in UFS and not (st.session_state["st"]["uf"] == _uf).any():
-        st.warning(f"Não há NCMs cadastrados para {_uf}. Importe a lista de ST de {_uf} na barra lateral, "
-                   "senão todos os itens serão tratados como SEM ST.")
-    arquivos = st.file_uploader("Envie XMLs (ou ZIP com XMLs)", type=["xml", "zip"], accept_multiple_files=True)
-    if arquivos and st.button("Analisar", type="primary"):
-        todos, itens_total, falhas, linhas_itens = [], 0, [], []
+    st.selectbox("UF da legislação de ST", [AUTO] + UFS, key="uf_st")
+    arquivos = st.file_uploader("Envie os XMLs (ou um ZIP com XMLs)", type=["xml", "zip"], accept_multiple_files=True)
+
+    if arquivos and st.button("Analisar e corrigir", type="primary"):
         entradas = []
         for f in arquivos:
             if f.name.lower().endswith(".zip"):
                 with zipfile.ZipFile(f) as z:
-                    for n in z.namelist():
-                        if n.lower().endswith(".xml"):
-                            entradas.append((n, z.read(n)))
+                    entradas += [(n, z.read(n)) for n in z.namelist() if n.lower().endswith(".xml")]
             else:
                 entradas.append((f.name, f.read()))
-        barra = st.progress(0.0)
-        for i, (nome, conteudo) in enumerate(entradas):
+
+        notas, falhas, pares = [], [], set()
+        for nome, conteudo in entradas:
             try:
                 nota, itens = parse_nfe(conteudo, nome)
-                itens_total += len(itens)
-                for it in itens:
-                    todos += auditar_item(nota, it)
-                    linhas_itens.append(classificar(nota, it))
+                notas.append((nota, itens))
+                uf_st = uf_da_st(nota)
+                pares |= {(uf_st, it["ncm"]) for it in itens if len(it["ncm"]) == 8}
             except Exception as e:
                 falhas.append((nome, str(e)))
-            barra.progress((i + 1) / max(len(entradas), 1))
-        st.session_state["resultado"] = pd.DataFrame(todos)
-        st.session_state["itens_df"] = pd.DataFrame(linhas_itens)
-        st.session_state["resumo"] = (len(entradas), itens_total, falhas)
 
-    if "resultado" in st.session_state:
-        df = st.session_state["resultado"]
-        n_xml, n_itens, falhas = st.session_state["resumo"]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("XMLs lidos", n_xml)
-        c2.metric("Itens analisados", n_itens)
-        c3.metric("Erros", int((df["Gravidade"] == "ERRO").sum()) if not df.empty else 0)
-        c4.metric("Alertas", int((df["Gravidade"] == "ALERTA").sum()) if not df.empty else 0)
-        for nome, msg in falhas:
+        with st.status(f"Consultando legislação de {len(pares)} NCM(s) com a IA...", expanded=False) as status:
+            infos, avisos = obter_infos(pares)
+            status.update(label="Legislação consultada", state="complete")
+
+        erros, linhas_itens = [], []
+        for nota, itens in notas:
+            uf_st = uf_da_st(nota)
+            for it in itens:
+                info = infos.get((uf_st, it["ncm"])) or info_interna(it["ncm"], uf_st)
+                erros += auditar_item(nota, it, info, uf_st)
+                linhas_itens.append(classificar(nota, it, info))
+        st.session_state["res"] = {
+            "erros": pd.DataFrame(erros), "itens": pd.DataFrame(linhas_itens), "infos": infos,
+            "avisos": avisos, "falhas": falhas, "n_xml": len(entradas), "uf": st.session_state.get("uf_st", AUTO)}
+
+    r = st.session_state.get("res")
+    if r:
+        df, resumo = r["erros"], montar_resumo(r["itens"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("XMLs lidos", r["n_xml"])
+        c2.metric("Itens analisados", len(r["itens"]))
+        c3.metric("Erros a corrigir", len(df))
+        for nome, msg in r["falhas"]:
             st.warning(f"{nome}: {msg}")
+        for a in r["avisos"]:
+            st.warning("IA indisponível para: " + a + " (usada base interna parcial nesses NCMs)")
+
+        st.subheader("❌ Erros encontrados e o correto")
         if df.empty:
-            st.success("Nenhuma inconsistência encontrada.")
-            vis = df
+            st.success("Nenhum erro encontrado.")
         else:
-            f1, f2 = st.columns(2)
-            grav = f1.multiselect("Gravidade", ["ERRO"], default=["ERRO"])
-            campos = f2.multiselect("Campo", sorted(df["Campo"].unique()))
-            vis = df[df["Gravidade"].isin(grav)]
-            if campos:
-                vis = vis[vis["Campo"].isin(campos)]
-            st.dataframe(vis, use_container_width=True, hide_index=True)
+            campos = st.multiselect("Filtrar por campo", sorted(df["Campo"].unique()))
+            st.dataframe(df[df["Campo"].isin(campos)] if campos else df, use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("📊 Resumo final: ST, Monofásico e Tributado")
-        st.caption(f"Legislação de ST aplicada: {st.session_state.get('uf_st', '')}  |  Simples Nacional")
-        resumo = montar_resumo(st.session_state.get("itens_df"))
+        st.caption(f"Legislação de ST aplicada: {r['uf']}  |  Simples Nacional")
         if not resumo.empty:
             m1, m2, m3 = st.columns(3)
             m1.metric("ST (ICMS-ST)", f"R$ {resumo.iloc[0]['Valor dos produtos (R$)']:,.2f}")
@@ -636,53 +568,49 @@ with aba1:
             m3.metric("Tributado normal", f"R$ {resumo.iloc[2]['Valor dos produtos (R$)']:,.2f}")
             st.dataframe(resumo, use_container_width=True, hide_index=True)
             st.caption("Item com ST e monofásico entra nas duas primeiras linhas (ICMS e PIS/COFINS são impostos distintos).")
+
+        ncm_df = tabela_ncm(r["infos"])
+        with st.expander("📚 Classificação e legislação por NCM (o que a IA encontrou)"):
+            st.dataframe(ncm_df, use_container_width=True, hide_index=True)
+
         d1, d2 = st.columns(2)
-        d1.download_button("⬇️ Excel", to_excel(vis, resumo), "inconsistencias.xlsx",
+        d1.download_button("⬇️ Excel", to_excel(df, resumo, ncm_df), "auditoria_xml.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        d2.download_button("⬇️ PDF", to_pdf(vis, resumo), "inconsistencias.pdf", "application/pdf")
+        d2.download_button("⬇️ PDF", to_pdf(df, resumo), "auditoria_xml.pdf", "application/pdf")
 
-# ---- Aba 2 ----
 with aba2:
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
-    ncm_q = c1.text_input("NCM (8 dígitos)", value="")
-    uf_o = c2.selectbox("UF origem", UFS, index=UFS.index("PE"))
-    uf_d = c3.selectbox("UF destino", UFS, index=UFS.index("PE"))
-    regime = c4.selectbox("Regime do emitente", ["Lucro Presumido / Real", "Simples Nacional"])
-    if ncm_q:
-        r = ficha_ncm(ncm_q, uf_o, uf_d, regime)
-        st.subheader(f"Ficha - NCM {r['ncm']}  ({r['tipo_oper']})")
-        e, s = st.columns(2)
-        with e:
-            st.markdown("**ICMS**")
-            st.write(f"CFOP: {r['cfop_saida']}")
-            st.write(f"CST/CSOSN: {r['cst_icms']}")
-            st.write(f"Alíquota: {r['aliquota_icms']}")
-            st.write(r["icms_texto"])
-            st.caption(r["icms_leg"])
-        with s:
+    c1, c2, c3 = st.columns([2, 1, 1])
+    ncm_q = so_digitos(c1.text_input("NCM (8 dígitos)"))
+    uf_o = c2.selectbox("UF origem", UFS, index=UFS.index("PE"), key="q_o")
+    uf_d = c3.selectbox("UF da ST / destino", UFS, index=UFS.index("PE"), key="q_d")
+    if len(ncm_q) == 8 and st.button("Consultar"):
+        with st.spinner("Consultando legislação..."):
+            infos, avisos = obter_infos({(uf_d, ncm_q)})
+        info = infos[(uf_d, ncm_q)]
+        interna = uf_o == uf_d
+        st.subheader(f"NCM {ncm_q} - {info['descricao']}")
+        a, b = st.columns(2)
+        with a:
+            st.markdown("**ICMS (Simples Nacional)**")
+            if info["st"]:
+                st.write(f"ICMS-ST: **SIM** em {uf_d} | CEST: {info['cest'] or '-'} | MVA: {info['mva'] or '-'}")
+                st.write(f"CSOSN: **500** | CFOP: **{'5405' if interna else '6404'}**")
+            else:
+                st.write(f"ICMS-ST: **NÃO** em {uf_d}")
+                st.write(f"CSOSN: **102** | CFOP: **{'5102' if interna else '6102'}**")
+            st.caption(f"{info['legislacao_st']} | {ricms(uf_d)}")
+        with b:
             st.markdown("**PIS / COFINS**")
-            st.write(r["pis_cofins"])
-            st.caption(r["pis_leg"])
+            if info["monofasico"]:
+                st.write(f"**Monofásico** (Tabela SPED {info['tabela_sped']}) - CST **04**, alíquota zero na revenda")
+            else:
+                st.write("**Tributado normal** - CST **49** (Simples Nacional)")
+            st.caption(info["legislacao_pis_cofins"])
             st.markdown("**IPI**")
-            st.write(r["ipi"])
-        st.warning("Resultado baseado nas bases carregadas. Confirme a vigência da legislação antes de aplicar.")
-
-# ---- Aba 3 ----
-with aba3:
-    st.markdown("""
-**Formato dos CSVs (separador `;` ou `,`):**
-
-`monofasico.csv` → `tabela;ncm_prefixo;descricao;legislacao`
-(tabela = 4.3.10 ou 4.3.11; `ncm_prefixo` aceita 4, 6 ou 8 dígitos)
-
-`st_base.csv` → `uf;ncm_prefixo;segmento;mva;legislacao`
-(use `*` em `uf` para valer em todos os estados; linhas com UF específica têm prioridade)
-
-Salve em uma pasta `dados/` junto do `app.py` para carregar automaticamente.
-""")
-    st.markdown("**Monofásicos (4.3.10 / 4.3.11)**")
-    st.session_state["mono"] = st.data_editor(st.session_state["mono"], num_rows="dynamic", use_container_width=True, key="ed_mono")
-    st.markdown("**Substituição Tributária por UF**")
-    st.session_state["st"] = st.data_editor(st.session_state["st"], num_rows="dynamic", use_container_width=True, key="ed_st")
-    st.download_button("⬇️ Baixar monofasico.csv", st.session_state["mono"].to_csv(index=False, sep=";"), "monofasico.csv")
-    st.download_button("⬇️ Baixar st_base.csv", st.session_state["st"].to_csv(index=False, sep=";"), "st_base.csv")
+            st.write(f"{info['ipi_aliquota'] or '-'}")
+            st.caption(info["ipi_legislacao"])
+        if info["fontes"]:
+            st.caption("Fontes: " + " | ".join(info["fontes"]))
+        st.caption(f"Origem da resposta: {info['origem']}")
+        for a_ in avisos:
+            st.warning(a_)
