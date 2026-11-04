@@ -35,7 +35,7 @@ CACHE_PATH = os.path.join("dados", "cache_ia.json")
 CACHE_DIAS = 30
 LOTE = 5            # NCMs por consulta à IA
 MODELO_PADRAO = "claude-sonnet-5-5"
-MODELO_GEMINI = "gemini-2.5-flash"   # gratuito e com busca do Google; troque em GEMINI_MODEL se quiser
+MODELO_GEMINI = "gemini-3.5-flash"   # gratuito e com busca do Google; troque em GEMINI_MODEL se quiser
 
 UFS = ["AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT",
        "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
