@@ -35,6 +35,7 @@ CACHE_PATH = os.path.join("dados", "cache_ia.json")
 CACHE_DIAS = 30
 LOTE = 5            # NCMs por consulta à IA
 MODELO_PADRAO = "claude-sonnet-5-5"
+MODELO_GEMINI = "gemini-2.5-flash"   # gratuito e com busca do Google; troque em GEMINI_MODEL se quiser
 
 UFS = ["AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT",
        "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
@@ -59,7 +60,12 @@ def so_digitos(v):
 # ---------------------------------------------------------------------------
 # 1) IA: classificação por NCM x UF (com busca na web)
 # ---------------------------------------------------------------------------
-_NOMES_CHAVE = ("ANTHROPIC_API_KEY", "anthropic_api_key", "CLAUDE_API_KEY", "API_KEY", "api_key")
+_NOMES_CHAVE = ("ANTHROPIC_API_KEY", "anthropic_api_key", "CLAUDE_API_KEY")
+_NOMES_GEMINI = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key", "google_api_key", "API_KEY", "api_key")
+
+
+class LimiteIA(Exception):
+    """Cota/limite de requisições da IA esgotado."""
 
 
 def _secrets():
@@ -69,30 +75,53 @@ def _secrets():
         return {}
 
 
-def _buscar_chave(d):
-    for nome in _NOMES_CHAVE:
+def _buscar_chave(d, nomes):
+    for nome in nomes:
         if nome in d and isinstance(d[nome], str) and d[nome].strip():
             return d[nome]
     for v in d.values():
         if hasattr(v, "items"):
-            r = _buscar_chave(dict(v.items()))
+            r = _buscar_chave(dict(v.items()), nomes)
             if r:
                 return r
     return ""
 
 
+def _limpa(k):
+    return str(k or "").strip().strip('"').strip("'").strip()
+
+
+def chave_ia():
+    """Retorna (provedor, chave). Gemini tem prioridade (gratuito); depois Claude."""
+    sec = _secrets()
+    gem = _limpa(_buscar_chave(sec, _NOMES_GEMINI) or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", ""))
+    ant = _limpa(_buscar_chave(sec, _NOMES_CHAVE) or os.environ.get("ANTHROPIC_API_KEY", ""))
+    manual = _limpa(st.session_state.get("chave_manual", ""))
+    if manual:
+        if manual.startswith("sk-ant-"):
+            ant = manual
+        else:
+            gem = manual
+    if gem:
+        return "gemini", gem
+    if ant:
+        return "anthropic", ant
+    return "", ""
+
+
 def get_key():
-    k = st.session_state.get("chave_manual") or _buscar_chave(_secrets()) or os.environ.get("ANTHROPIC_API_KEY", "")
-    return str(k).strip().strip('"').strip("'").strip()
+    return chave_ia()[1]
 
 
-def get_modelo():
+def get_modelo(prov="anthropic"):
+    nome = "GEMINI_MODEL" if prov == "gemini" else "ANTHROPIC_MODEL"
+    padrao = MODELO_GEMINI if prov == "gemini" else MODELO_PADRAO
     try:
-        if "ANTHROPIC_MODEL" in st.secrets:
-            return st.secrets["ANTHROPIC_MODEL"]
+        if nome in st.secrets:
+            return st.secrets[nome]
     except Exception:
         pass
-    return os.environ.get("ANTHROPIC_MODEL", MODELO_PADRAO)
+    return os.environ.get(nome, padrao)
 
 
 SISTEMA = """Você é um especialista tributário brasileiro (ICMS-ST, PIS/COFINS monofásico, IPI, SPED).
@@ -150,6 +179,46 @@ def _chamar_ia(ncms, uf, chave, modelo):
         break
     texto = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     return _extrair_json(texto)
+
+
+def _chamar_gemini(ncms, uf, chave, modelo):
+    """Consulta o Gemini com busca do Google (Google Search grounding). Sem st.* (roda em thread)."""
+    import requests
+    corpo = {
+        "systemInstruction": {"parts": [{"text": SISTEMA.format(hoje=date.today().strftime("%d/%m/%Y"))}]},
+        "contents": [{"role": "user", "parts": [{"text": PROMPT.format(uf=uf, ncms=", ".join(ncms))}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8000},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+    r = None
+    for espera in (0, 15, 30):
+        time.sleep(espera)
+        r = requests.post(url, headers={"x-goog-api-key": chave, "Content-Type": "application/json"},
+                          json=corpo, timeout=180)
+        if r.status_code not in (429, 500, 503):
+            break
+    if r.status_code == 429:
+        raise LimiteIA("Limite gratuito do Gemini atingido (erro 429). O que já foi consultado ficou guardado; "
+                       "rode de novo mais tarde (a cota diária reinicia à meia-noite do Pacífico).")
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
+    cand = (r.json().get("candidates") or [{}])[0]
+    texto = "".join(p_.get("text", "") for p_ in cand.get("content", {}).get("parts", []))
+    lista = _extrair_json(texto)
+    sites = []
+    for ch in cand.get("groundingMetadata", {}).get("groundingChunks", []):
+        w = ch.get("web", {})
+        if w.get("title") and w["title"] not in sites:
+            sites.append(w["title"])
+    for d in lista:
+        if not d.get("fontes"):
+            d["fontes"] = sites[:3]
+    return lista
+
+
+def _chamar(prov, ncms, uf, chave, modelo):
+    return (_chamar_gemini if prov == "gemini" else _chamar_ia)(ncms, uf, chave, modelo)
 
 
 def _bool(v):
@@ -234,21 +303,31 @@ def obter_infos(pares):
         else:
             pendentes.setdefault(uf, []).append(ncm)
 
-    chave, modelo = get_key(), get_modelo()
-    tarefas = [(uf, ncms[i:i + LOTE]) for uf, ncms in pendentes.items() for i in range(0, len(ncms), LOTE)]
+    prov, chave = chave_ia()
+    modelo = get_modelo(prov or "anthropic")
+    n_lote = 10 if prov == "gemini" else LOTE   # menos requisições = cabe na cota gratuita
+    tarefas = [(uf, ncms[i:i + n_lote]) for uf, ncms in pendentes.items() for i in range(0, len(ncms), n_lote)]
+
+    parar = {"v": False}
 
     def rodar(t):
         uf, lote = t
-        for tentativa in range(2):
+        if parar["v"]:
+            return t, None, "limite da IA atingido - rode novamente mais tarde (o já consultado fica guardado)"
+        erro = ""
+        for _ in range(2):
             try:
-                return t, _chamar_ia(lote, uf, chave, modelo), None
+                return t, _chamar(prov, lote, uf, chave, modelo), None
+            except LimiteIA as e:
+                parar["v"] = True
+                return t, None, str(e)
             except Exception as e:  # noqa
                 erro = str(e)[:200]
                 time.sleep(2)
         return t, None, erro
 
     if tarefas and chave:
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=1 if prov == "gemini" else 4) as ex:
             resultados = list(ex.map(rodar, tarefas))
     else:
         resultados = [(t, None, "chave da API não configurada") for t in tarefas]
@@ -530,15 +609,17 @@ if not get_key():
     st.error("Chave da IA não encontrada - a análise está bloqueada.")
     nomes = list(_secrets().keys())
     st.write("Nomes encontrados nos Secrets do app: " + (", ".join(f"`{n}`" for n in nomes) if nomes else "**nenhum**"))
-    st.markdown("Em **Manage app > Settings > Secrets** deve existir exatamente uma linha, sem espaços extras e com aspas retas:\n\n"
-                "`ANTHROPIC_API_KEY = \"sk-ant-...\"`\n\n"
-                "Depois de salvar, use **Reboot app** no menu do app. Ou cole a chave abaixo (vale só nesta sessão):")
-    st.text_input("Chave da API Anthropic", type="password", key="chave_input")
+    st.markdown("**Opção gratuita (Gemini):** gere a chave em `aistudio.google.com/apikey` (conta Google, sem cartão) e, em "
+                "**Manage app > Settings > Secrets**, salve `GEMINI_API_KEY = \"AIza...\"` e use **Reboot app**. "
+                "Funciona também com `ANTHROPIC_API_KEY` (Claude, pago).\n\n"
+                "Ou cole a chave abaixo (vale só nesta sessão; o app reconhece Gemini ou Claude pelo início da chave):")
+    st.text_input("Chave da API (Gemini ou Claude)", type="password", key="chave_input")
     if st.session_state.get("chave_input"):
         st.session_state["chave_manual"] = st.session_state["chave_input"]
         st.rerun()
-elif not get_key().startswith("sk-ant-"):
-    st.warning("A chave cadastrada não começa com `sk-ant-`: confira se copiou a chave inteira e correta.")
+else:
+    _prov, _ = chave_ia()
+    st.caption(f"IA ativa: {'Gemini (' + get_modelo('gemini') + ')' if _prov == 'gemini' else 'Claude (' + get_modelo() + ')'}")
 
 aba1, aba2 = st.tabs(["📂 Análise em lote", "🔎 Consulta por NCM"])
 
