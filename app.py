@@ -201,12 +201,69 @@ def formatar_ncm(ncm: str) -> str:
     return n
 
 
+NCM_BASE: dict = {"ncm8": {}, "capitulos": {}, "posicoes": {}}
+
+
+def carregar_base_ncm(caminho: str = "base_ncm.json") -> None:
+    """Carrega a tabela completa de NCM (todos os codigos de 8 digitos)."""
+    global NCM_BASE
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    for c in (caminho, os.path.join(aqui, caminho)):
+        if os.path.exists(c):
+            with open(c, encoding="utf-8") as f:
+                NCM_BASE = json.load(f)
+            return
+
+
+def atualizar_ncm_oficial(caminho: str = "base_ncm.json") -> int:
+    """Baixa a tabela NCM vigente do Portal Unico Siscomex e regrava base_ncm.json."""
+    import urllib.request
+    url = ("https://portalunico.siscomex.gov.br/classif/api/publico/nomenclatura/"
+           "download/json?perfil=PUBLICO")
+    with urllib.request.urlopen(url, timeout=60) as r:
+        dados = json.loads(r.read().decode("utf-8"))
+    ncm8, pos, cap = {}, {}, {}
+    for it in dados.get("Nomenclaturas", []):
+        cod = limpar_ncm(it.get("Codigo", ""))
+        if "9999" not in str(it.get("Data_Fim", "9999")):
+            continue  # codigo extinto
+        desc = re.sub(r"^[\s\-]+", "", it.get("Descricao", "")).strip()
+        if len(cod) == 8:
+            ncm8[cod] = {"d": desc, "h": ""}
+        elif len(cod) == 4:
+            pos[cod] = desc
+        elif len(cod) == 2:
+            cap[cod] = desc
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(dict(fonte="Portal Unico Siscomex", ncm8=ncm8, capitulos=cap, posicoes=pos),
+                  f, ensure_ascii=False, separators=(",", ":"))
+    carregar_base_ncm(caminho)
+    return len(ncm8)
+
+
+def descricao_ncm(ncm: str) -> str | None:
+    n = limpar_ncm(ncm)
+    it = NCM_BASE["ncm8"].get(n)
+    if not it:
+        return None
+    pos = NCM_BASE["posicoes"].get(n[:4], "")
+    return f"{pos} › {it['d']}" if pos else it["d"]
+
+
+def buscar_por_descricao(termo: str, limite: int = 30) -> list:
+    t = termo.lower().strip()
+    if len(t) < 3:
+        return []
+    return [(formatar_ncm(c), v["d"]) for c, v in NCM_BASE["ncm8"].items()
+            if t in v["d"].lower() or t in NCM_BASE["posicoes"].get(c[:4], "").lower()][:limite]
+
+
 def produto_generico(ncm: str) -> dict:
     """Regra geral quando a NCM nao esta cadastrada (para nao travar a analise)."""
     return dict(
         prefixos=[limpar_ncm(ncm)],
-        titulo=f"NCM {formatar_ncm(ncm)} - sem regra especifica cadastrada (regra geral)",
-        capitulo=f"Capitulo {limpar_ncm(ncm)[:2]} da NCM",
+        titulo=descricao_ncm(ncm) or f"NCM {formatar_ncm(ncm)} - nao localizada na tabela NCM",
+        capitulo=f"Cap. {limpar_ncm(ncm)[:2]} - " + NCM_BASE["capitulos"].get(limpar_ncm(ncm)[:2], ""),
         ipi=dict(aliq=None, base="Consultar a TIPI para esta NCM"),
         pis_cofins=dict(tipo="cumulativo_ou_nao", obs="Assumida tributacao normal."),
         cest="Verificar no Conv. ICMS 142/2018 se a NCM tem CEST",
@@ -282,6 +339,12 @@ def analisar(ncm: str, uf_origem: str, uf_destino: str, regime: str) -> Ficha | 
     simples = regime == "Simples Nacional"
     inter = uf_origem != uf_destino
 
+    real = descricao_ncm(ncm)
+    if real:
+        p = dict(p, titulo=real)
+    elif NCM_BASE["ncm8"] and len(limpar_ncm(ncm)) == 8:
+        p = dict(p, alertas=p["alertas"] + ["NCM nao encontrada na tabela vigente: pode estar extinta "
+                                             "ou digitada errada. Valide no Portal Unico."])
     f = Ficha(ncm=formatar_ncm(ncm), uf_origem=uf_origem, uf_destino=uf_destino,
               regime=regime, produto=p, sujeito_st=st)
 
@@ -425,10 +488,15 @@ def main() -> None:
 
     st.set_page_config(page_title="Analise Tributaria", page_icon="📑", layout="centered")
     st.markdown(CSS, unsafe_allow_html=True)
+    carregar_base_ncm()
     carregar_base_extra()
 
     st.title("📑 Analise Tributaria por NCM")
     c1, c2 = st.columns([2, 1])
+    with st.expander("🔎 Buscar NCM por descricao"):
+        termo = st.text_input("Ex.: calca feminina, biscoito, celular")
+        for cod, desc in buscar_por_descricao(termo):
+            st.write(f"**{cod}** — {desc}")
     ncm = c1.text_input("NCM", value="1905.90.90", help="Digite com ou sem pontos")
     regime = c2.selectbox("Regime do contribuinte", REGIMES)
     c3, c4 = st.columns(2)
@@ -486,6 +554,13 @@ def main() -> None:
     if d2.button("Nova analise"):
         st.rerun()
 
+    with st.expander("⚙ Tabela NCM"):
+        st.write(f"{len(NCM_BASE['ncm8'])} NCMs carregadas — fonte: {NCM_BASE.get('fonte', 'n/d')}")
+        if st.button("Atualizar tabela pelo Portal Unico (Siscomex)"):
+            try:
+                st.success(f"{atualizar_ncm_oficial()} NCMs atualizadas.")
+            except Exception as e:  # noqa
+                st.error(f"Falha ao baixar: {e}")
     st.caption("Base inicial para estudo. Valide aliquotas, MVA e artigos nas fontes oficiais.")
 
 
