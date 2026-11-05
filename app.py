@@ -163,6 +163,17 @@ PRODUTOS = [
         st=dict(segmento="Segmento 21", convenio="Convenio ICMS 142/2018", ufs={}),
         alertas=["Produtos de informatica/telecom: beneficios em PPB e Lei de Informatica."],
     ),
+    dict(
+        prefixos=["61", "62"],
+        titulo="Vestuario e seus acessorios (malha - cap. 61 / exceto malha - cap. 62)",
+        capitulo="Cap. 61 e 62 - Artigos de vestuario e acessorios, de malha ou nao",
+        ipi=dict(aliq=0.0, base="TIPI - capitulos 61/62 (conferir a aliquota da subposicao)"),
+        pis_cofins=dict(tipo="cumulativo_ou_nao", obs="Tributacao normal (nao monofasico)."),
+        cest="Conferir no Conv. ICMS 142/2018 se a NCM possui CEST (vestuario em geral nao tem ST)",
+        st=dict(segmento="Conferir", convenio="Convenio ICMS 142/2018", ufs={}),
+        alertas=["Vestuario em geral e tributado normalmente (sem ST) - confirme no RICMS da UF "
+                 "e no Anexo de ST, pois ha excecoes e beneficios estaduais."],
+    ),
 ]
 
 
@@ -190,10 +201,44 @@ def formatar_ncm(ncm: str) -> str:
     return n
 
 
+def produto_generico(ncm: str) -> dict:
+    """Regra geral quando a NCM nao esta cadastrada (para nao travar a analise)."""
+    return dict(
+        prefixos=[limpar_ncm(ncm)],
+        titulo=f"NCM {formatar_ncm(ncm)} - sem regra especifica cadastrada (regra geral)",
+        capitulo=f"Capitulo {limpar_ncm(ncm)[:2]} da NCM",
+        ipi=dict(aliq=None, base="Consultar a TIPI para esta NCM"),
+        pis_cofins=dict(tipo="cumulativo_ou_nao", obs="Assumida tributacao normal."),
+        cest="Verificar no Conv. ICMS 142/2018 se a NCM tem CEST",
+        st=dict(segmento="Nao cadastrado", convenio="Convenio ICMS 142/2018", ufs={}),
+        alertas=["NCM sem regra especifica na base: o resultado usa a REGRA GERAL (tributacao normal, "
+                 "sem ST). Confirme beneficios, ST e IPI antes de usar."],
+    )
+
+
+def importar_tipi_csv(caminho: str, saida: str = "base_extra.json") -> int:
+    """Importa CSV (colunas: ncm;descricao;ipi) e gera base_extra.json com uma regra por NCM."""
+    import csv
+    itens = []
+    with open(caminho, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f, delimiter=";"):
+            n = limpar_ncm(r["ncm"])
+            ipi = r.get("ipi", "").replace("%", "").replace(",", ".").strip()
+            itens.append(dict(
+                prefixos=[n], titulo=r["descricao"], capitulo=f"Capitulo {n[:2]}",
+                ipi=dict(aliq=float(ipi) if ipi.replace(".", "").isdigit() else None, base="TIPI"),
+                pis_cofins=dict(tipo="cumulativo_ou_nao", obs="Tributacao normal."),
+                cest="Conferir CEST", st=dict(segmento="Conferir", convenio="Conv. ICMS 142/2018", ufs={}),
+                alertas=[]))
+    with open(saida, "w", encoding="utf-8") as f:
+        json.dump(itens, f, ensure_ascii=False, indent=1)
+    return len(itens)
+
+
 def buscar_produto(ncm: str) -> dict | None:
     n = limpar_ncm(ncm)
-    achados = [p for p in PRODUTOS for pre in p["prefixos"] if n.startswith(pre)]
-    return achados[0] if achados else None
+    achados = [(len(pre), p) for p in PRODUTOS for pre in p["prefixos"] if n.startswith(pre)]
+    return max(achados, key=lambda x: x[0])[1] if achados else None
 
 
 def aliquota_interestadual(origem: str, destino: str, importado: bool = False) -> float:
@@ -228,9 +273,9 @@ class Ficha:
 
 
 def analisar(ncm: str, uf_origem: str, uf_destino: str, regime: str) -> Ficha | None:
-    p = buscar_produto(ncm)
-    if not p:
+    if len(limpar_ncm(ncm)) < 4:
         return None
+    p = buscar_produto(ncm) or produto_generico(ncm)
     uf_info = UFS[uf_destino]
     st_uf = p["st"]["ufs"].get(uf_destino)
     st = st_uf is not None
