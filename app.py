@@ -35,7 +35,7 @@ CACHE_PATH = os.path.join("dados", "cache_ia.json")
 CACHE_DIAS = 30
 LOTE = 5            # NCMs por consulta à IA
 MODELO_PADRAO = "claude-sonnet-5-5"
-MODELO_GEMINI = "gemini-3.5-flash"   # gratuito e com busca do Google; troque em GEMINI_MODEL se quiser
+MODELO_GEMINI = "gemini-2.5-flash"   # gratuito e com busca do Google; troque em GEMINI_MODEL se quiser
 
 UFS = ["AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT",
        "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
@@ -152,6 +152,13 @@ Retorne uma LISTA JSON com um objeto por NCM, na mesma ordem, com exatamente est
 }}"""
 
 
+PROMPT_FICHA = PROMPT.replace(
+    '"fontes": ["urls oficiais consultadas"]',
+    '"alertas": ["frases curtas e objetivas: alíquota/regra da UF, ST, benefício fiscal, particularidade do NCM"],\n'
+    ' "fundamentos": [{{"titulo": "tema (ex.: Regime de ST)", "norma": "Lei/Decreto/Convênio nº ... e artigo", "descricao": "o que a norma determina"}}],\n'
+    ' "fontes": ["urls oficiais consultadas"]')
+
+
 def _extrair_json(texto):
     texto = texto.strip()
     texto = re.sub(r"^```(?:json)?|```$", "", texto, flags=re.M).strip()
@@ -162,11 +169,11 @@ def _extrair_json(texto):
     return [json.loads(texto[i:j + 1])]
 
 
-def _chamar_ia(ncms, uf, chave, modelo):
+def _chamar_ia(ncms, uf, chave, modelo, prompt=None):
     """Uma consulta (lote de NCMs) com busca na web. Sem uso de st.* (roda em thread)."""
     import anthropic
     client = anthropic.Anthropic(api_key=chave)
-    mensagens = [{"role": "user", "content": PROMPT.format(uf=uf, ncms=", ".join(ncms))}]
+    mensagens = [{"role": "user", "content": (prompt or PROMPT).format(uf=uf, ncms=", ".join(ncms))}]
     for _ in range(4):
         msg = client.messages.create(
             model=modelo, max_tokens=6000,
@@ -181,12 +188,12 @@ def _chamar_ia(ncms, uf, chave, modelo):
     return _extrair_json(texto)
 
 
-def _chamar_gemini(ncms, uf, chave, modelo):
+def _chamar_gemini(ncms, uf, chave, modelo, prompt=None):
     """Consulta o Gemini com busca do Google (Google Search grounding). Sem st.* (roda em thread)."""
     import requests
     corpo = {
         "systemInstruction": {"parts": [{"text": SISTEMA.format(hoje=date.today().strftime("%d/%m/%Y"))}]},
-        "contents": [{"role": "user", "parts": [{"text": PROMPT.format(uf=uf, ncms=", ".join(ncms))}]}],
+        "contents": [{"role": "user", "parts": [{"text": (prompt or PROMPT).format(uf=uf, ncms=", ".join(ncms))}]}],
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8000},
     }
@@ -217,8 +224,8 @@ def _chamar_gemini(ncms, uf, chave, modelo):
     return lista
 
 
-def _chamar(prov, ncms, uf, chave, modelo):
-    return (_chamar_gemini if prov == "gemini" else _chamar_ia)(ncms, uf, chave, modelo)
+def _chamar(prov, ncms, uf, chave, modelo, prompt=None):
+    return (_chamar_gemini if prov == "gemini" else _chamar_ia)(ncms, uf, chave, modelo, prompt)
 
 
 def _bool(v):
@@ -238,6 +245,8 @@ def _normalizar(d, ncm, origem):
         "legislacao_pis_cofins": str(d.get("legislacao_pis_cofins", "")),
         "ipi_aliquota": str(d.get("ipi_aliquota", "")), "ipi_legislacao": str(d.get("ipi_legislacao", "")),
         "fontes": [str(f) for f in fontes][:3], "origem": origem, "ts": time.time(),
+        "alertas": [str(a) for a in (d.get("alertas") or [])][:8],
+        "fundamentos": [f for f in (d.get("fundamentos") or []) if isinstance(f, dict)][:8],
     }
 
 
@@ -349,6 +358,26 @@ def obter_infos(pares):
             avisos.append(f"UF {uf}, NCMs {', '.join(lote)}: {erro}")
     _salvar_cache(cache)
     return infos, avisos
+
+
+def ficha_ia(ncm, uf):
+    """Ficha fiscal completa de um NCM (como o consultor da Econet). Retorna (info, erro)."""
+    cache = _ler_cache()
+    k = f"{uf}|{ncm}|ficha"
+    c = cache.get(k)
+    if c and c.get("ts", 0) > time.time() - CACHE_DIAS * 86400:
+        return c, None
+    prov, chave = chave_ia()
+    if not chave:
+        return info_interna(ncm, uf), "chave da IA não configurada"
+    try:
+        d = _chamar(prov, [ncm], uf, chave, get_modelo(prov), PROMPT_FICHA)[0]
+        info = _normalizar(d, ncm, "IA + busca web")
+        cache[k] = info
+        _salvar_cache(cache)
+        return info, None
+    except Exception as e:  # noqa
+        return info_interna(ncm, uf), str(e)[:200]
 
 
 # ---------------------------------------------------------------------------
@@ -712,37 +741,96 @@ with aba1:
 
 with aba2:
     c1, c2, c3 = st.columns([2, 1, 1])
-    ncm_q = so_digitos(c1.text_input("NCM (8 dígitos)"))
-    uf_o = c2.selectbox("UF origem", UFS, index=UFS.index("PE"), key="q_o")
+    ncm_q = so_digitos(c1.text_input("NCM (8 dígitos)", key="f_ncm"))
+    uf_o = c2.selectbox("UF do emitente", UFS, index=UFS.index("PE"), key="q_o")
     uf_d = c3.selectbox("UF da ST / destino", UFS, index=UFS.index("PE"), key="q_d")
-    if len(ncm_q) == 8 and st.button("Consultar"):
-        with st.spinner("Consultando legislação..."):
-            infos, avisos = obter_infos({(uf_d, ncm_q)})
-        info = infos[(uf_d, ncm_q)]
-        interna = uf_o == uf_d
-        st.subheader(f"NCM {ncm_q} - {info['descricao']}")
-        a, b = st.columns(2)
-        with a:
-            st.markdown("**ICMS (Simples Nacional)**")
-            if info["st"]:
-                st.write(f"ICMS-ST: **SIM** em {uf_d} | CEST: {info['cest'] or '-'} | MVA: {info['mva'] or '-'}")
-                st.write(f"CSOSN: **500** | CFOP: **{'5405' if interna else '6404'}**")
-            else:
-                st.write(f"ICMS-ST: **NÃO** em {uf_d}")
-                st.write(f"CSOSN: **102** | CFOP: **{'5102' if interna else '6102'}**")
-            st.caption(f"{info['legislacao_st']} | {ricms(uf_d)}")
-        with b:
+    b1, b2, _ = st.columns([1, 1, 5])
+    if b1.button("Gerar ficha", type="primary", disabled=len(ncm_q) != 8 or not get_key()):
+        with st.spinner("Pesquisando legislação..."):
+            info_f, erro_f = ficha_ia(ncm_q, uf_d)
+        st.session_state["ficha"] = {"ncm": ncm_q, "uf_o": uf_o, "uf_d": uf_d, "info": info_f, "erro": erro_f}
+    if b2.button("Nova análise"):
+        st.session_state.pop("ficha", None)
+        st.rerun()
+
+    f = st.session_state.get("ficha")
+    if f:
+        info, ncm, uo, ud = f["info"], f["ncm"], f["uf_o"], f["uf_d"]
+        interna, e_st, e_mono = uo == ud, info["st"], info["monofasico"]
+        ncm_fmt = f"{ncm[:4]}.{ncm[4:6]}.{ncm[6:]}"
+        cf_ent = ("1403", "2403") if e_st else ("1102", "2102")
+        cf_sai = ("5405", "6404") if e_st else ("5102", "6102")
+        i = 0 if interna else 1
+        if f["erro"]:
+            st.warning("IA indisponível para este NCM (" + f["erro"] + "). Mostrando a base interna parcial.")
+
+        with st.container(border=True):
+            st.markdown(f"**CFOP correto para este NCM** &nbsp; ({'operação interna' if interna else 'operação interestadual'})")
+            st.write(f"Entrada (compra p/ comercialização): **{cf_ent[i]}**  |  Saída (revenda): **{cf_sai[i]}**")
+            st.caption(f"Interna: {cf_ent[0]} / {cf_sai[0]}  -  Interestadual: {cf_ent[1]} / {cf_sai[1]}")
+
+        with st.container(border=True):
+            cor = "#b45309" if e_st else "#15803d"
+            rotulo = "ICMS-ST" if e_st else "NORMAL"
+            st.markdown(f"#### Ficha fiscal IA - NCM {ncm_fmt} • {ud} "
+                        f"<span style='background:{cor}22;color:{cor};padding:2px 10px;border-radius:12px;font-size:0.7em'>{rotulo}</span>"
+                        + (" <span style='background:#1d4ed822;color:#1d4ed8;padding:2px 10px;border-radius:12px;font-size:0.7em'>MONOFÁSICO</span>" if e_mono else ""),
+                        unsafe_allow_html=True)
+            if info["descricao"]:
+                st.write(f"**{info['descricao']}**")
+            st.write(f"Classificação: {'sujeito' if e_st else 'NÃO sujeito'} ao ICMS-ST em {ud}"
+                     + (f" (segmento {info['segmento']}, CEST {info['cest'] or '-'}, MVA {info['mva'] or '-'})" if e_st else "")
+                     + f"; PIS/COFINS {'monofásico (Tabela SPED ' + info['tabela_sped'] + ')' if e_mono else 'em tributação normal'}.")
+
+        col_e, col_s = st.columns(2)
+        with col_e, st.container(border=True):
+            st.markdown("**⬇ ENTRADA**")
+            st.write(f"CFOP interno: **{cf_ent[0]}**  |  interestadual: **{cf_ent[1]}**")
+            st.write("ICMS/PIS/COFINS: **sem apropriação de crédito** (Simples Nacional)")
+            st.caption("Com ST, o ICMS-ST é retido pelo fornecedor e compõe o custo." if e_st else "Operação com tributação normal na compra.")
+        with col_s, st.container(border=True):
+            st.markdown("**⬆ SAÍDA**")
+            st.write(f"CFOP interno: **{cf_sai[0]}**  |  interestadual: **{cf_sai[1]}**")
+            st.write(f"CSOSN: **{'500' if e_st else '102'}** - " + ("ICMS-ST já retido anteriormente" if e_st else "tributada sem permissão de crédito"))
+            st.write("ICMS: **sem destaque** na nota (recolhido no DAS" + ("; receita segregada por ST)" if e_st else ")"))
+            if e_st:
+                st.caption("Substituto tributário (fabricante/importador): CSOSN 201/202 e CFOP 5401/5403 e 6401/6403.")
+
+        col_p, col_i = st.columns(2)
+        with col_p, st.container(border=True):
             st.markdown("**PIS / COFINS**")
-            if info["monofasico"]:
-                st.write(f"**Monofásico** (Tabela SPED {info['tabela_sped']}) - CST **04**, alíquota zero na revenda")
+            if e_mono:
+                st.write(f"Monofásico - CST **04**, alíquota **0%** na revenda (Tabela SPED {info['tabela_sped']})")
             else:
-                st.write("**Tributado normal** - CST **49** (Simples Nacional)")
+                st.write("Tributação normal - CST **49** (recolhido no DAS)")
             st.caption(info["legislacao_pis_cofins"])
+        with col_i, st.container(border=True):
             st.markdown("**IPI**")
-            st.write(f"{info['ipi_aliquota'] or '-'}")
-            st.caption(info["ipi_legislacao"])
+            st.write(f"Alíquota: **{info['ipi_aliquota'] or '-'}**")
+            st.caption(info["ipi_legislacao"] or "Consultar a TIPI vigente")
+
+        alertas = list(info.get("alertas") or [])
+        if e_st:
+            alertas.append("Segregue no PGDAS a receita de revenda com ICMS-ST (exclusão do ICMS do DAS).")
+        if e_mono:
+            alertas.append("Segregue no PGDAS a receita monofásica (exclusão de PIS/COFINS do DAS).")
+        with st.container(border=True):
+            st.markdown("**⚠ Alertas**")
+            for a_ in alertas:
+                st.write("• " + a_)
+
+        fund = list(info.get("fundamentos") or [])
+        if not fund:
+            if info["legislacao_st"]:
+                fund.append({"titulo": "ICMS-ST", "norma": info["legislacao_st"], "descricao": f"Regime de ST em {ud} - {ricms(ud)}"})
+            if info["legislacao_pis_cofins"]:
+                fund.append({"titulo": "PIS/COFINS", "norma": info["legislacao_pis_cofins"], "descricao": ""})
+        with st.container(border=True):
+            st.markdown("**📚 Fundamentos legais**")
+            for fd in fund:
+                st.markdown(f"**{fd.get('titulo', '')}** - {fd.get('norma', '')}")
+                if fd.get("descricao"):
+                    st.caption(fd["descricao"])
         if info["fontes"]:
             st.caption("Fontes: " + " | ".join(info["fontes"]))
         st.caption(f"Origem da resposta: {info['origem']}")
-        for a_ in avisos:
-            st.warning(a_)
