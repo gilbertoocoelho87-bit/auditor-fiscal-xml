@@ -117,18 +117,27 @@ PRODUTOS = [
         ],
     ),
     dict(
-        prefixos=["2202"],
-        titulo="Aguas, incluindo aguas minerais e gaseificadas, adicionadas de acucar ou outros "
-               "edulcorantes ou aromatizadas, e outras bebidas nao alcoolicas",
+        prefixos=["2201", "2202", "2203"],
+        titulo="Bebidas frias: aguas, refrigerantes, outras bebidas nao alcoolicas e cervejas/chopes",
         capitulo="Cap. 22 - Bebidas, liquidos alcoolicos e vinagres",
-        ipi=dict(aliq=None, base="TIPI - consultar subposicao (varia com o tipo de bebida)"),
+        ipi=dict(aliq=None, base="TIPI - consultar a subposicao (varia por tipo de bebida)"),
         pis_cofins=dict(tipo="monofasico",
                         obs="Bebidas frias: regime monofasico (Lei 13.097/2015) - fabricante/importador "
                             "recolhe; revenda com aliquota zero."),
-        cest="Segmento 03 - Bebidas nao alcoolicas",
-        st=dict(segmento="Segmento 03", convenio="Convenio ICMS 142/2018",
-                ufs={"PE": dict(mva_orig=None, anexo="Anexo 13 / Anexo 37 do RICMS-PE", conferir=True)}),
-        alertas=["Verificar adicional de FCP/FECOEP nas UFs que o aplicam a bebidas."],
+        cest="Segmento 03 - Cervejas, chopes, refrigerantes, aguas e outras bebidas (Conv. ICMS 142/2018)",
+        st=dict(
+            segmento="Segmento 03 (Bebidas frias)",
+            convenio="Convenio ICMS 142/2018 e Convenio ICMS 52/2017",
+            ufs={"PE": dict(mva_orig=None,
+                            anexo="Anexo 13 (ST) do RICMS-PE (Decreto 44.650/2017) - bebidas frias",
+                            conferir=True)},
+            padrao=dict(mva_orig=None, anexo="Anexo de ST do RICMS da UF - bebidas frias (Seg. 03)",
+                        conferir=True),
+        ),
+        alertas=["Bebidas frias (cervejas, chopes, refrigerantes, aguas): sujeitas a ICMS-ST. A base "
+                 "da ST costuma ser preco medio ponderado a consumidor final (PMPF/pauta) ou MVA, "
+                 "conforme o ato da UF - confira o valor vigente.",
+                 "Verificar adicional de FCP/FECOEP nas UFs que o aplicam a bebidas."],
     ),
     dict(
         prefixos=["3004"],
@@ -327,6 +336,8 @@ class Ficha:
     ipi: dict = field(default_factory=dict)
     alertas: list = field(default_factory=list)
     fundamentos: list = field(default_factory=list)
+    confianca: str = ""
+    motivos_confianca: list = field(default_factory=list)
 
 
 def analisar(ncm: str, uf_origem: str, uf_destino: str, regime: str) -> Ficha | None:
@@ -334,7 +345,7 @@ def analisar(ncm: str, uf_origem: str, uf_destino: str, regime: str) -> Ficha | 
         return None
     p = buscar_produto(ncm) or produto_generico(ncm)
     uf_info = UFS[uf_destino]
-    st_uf = p["st"]["ufs"].get(uf_destino)
+    st_uf = p["st"]["ufs"].get(uf_destino) or p["st"].get("padrao")
     st = st_uf is not None
     simples = regime == "Simples Nacional"
     inter = uf_origem != uf_destino
@@ -428,6 +439,21 @@ def analisar(ncm: str, uf_origem: str, uf_destino: str, regime: str) -> Ficha | 
     f.alertas.append("Reforma tributaria: em 2026 ha CBS 0,9% e IBS 0,1% (ano de teste, compensaveis, "
                      "LC 214/2025). PIS/COFINS/ICMS/ISS serao extintos gradualmente ate 2033.")
 
+    # ----- GRAU DE CONFIANCA (nunca "alta": a base nao e validada por fonte oficial em tempo real)
+    motivos = []
+    generico = not any(pre and limpar_ncm(ncm).startswith(pre) for pre in p["prefixos"][:1]) \
+        or p["titulo"].startswith("NCM ") or p["st"]["segmento"] in ("Nao cadastrado",)
+    if p["st"]["segmento"] == "Nao cadastrado" or p["st"]["segmento"] == "Conferir":
+        motivos.append("NCM sem regra fiscal especifica cadastrada (regra geral): ST, beneficios e "
+                       "aliquotas NAO foram verificados.")
+    if st and (st_uf or {}).get("conferir"):
+        motivos.append("MVA/PMPF/anexo de ST marcados para conferencia.")
+    if p["ipi"]["aliq"] is None:
+        motivos.append("Aliquota de IPI nao informada: consultar a TIPI.")
+    motivos.append("Aliquotas e artigos de lei devem ser confirmados na legislacao vigente da UF.")
+    f.motivos_confianca = motivos
+    f.confianca = "BAIXA" if p["st"]["segmento"] in ("Nao cadastrado", "Conferir") else "MEDIA"
+
     # ----- FUNDAMENTOS
     f.fundamentos = [
         (f"Aliquota modal de {uf_destino}", UFS[uf_destino]["lei"]),
@@ -511,6 +537,9 @@ def main() -> None:
         return
 
     p = f.produto
+    aviso = "**Confianca " + f.confianca + "** - apoio a analise, nao substitui validacao:\n\n" + \
+            "\n".join(f"- {m}" for m in f.motivos_confianca)
+    (st.error if f.confianca == "BAIXA" else st.warning)(aviso)
     st.markdown(
         f"<div class='card'><span class='tag'>Ficha fiscal IA — NCM {f.ncm} • {uf_d}</span>"
         f"<div class='h' style='margin-top:8px'>{p['titulo']}</div>"
@@ -540,7 +569,7 @@ def main() -> None:
 
     if f.sujeito_st:
         with st.expander("🧮 Simulador de ICMS-ST"):
-            mva_o = p["st"]["ufs"][uf_d]["mva_orig"] or 0.0
+            mva_o = (p["st"]["ufs"].get(uf_d) or p["st"].get("padrao"))["mva_orig"] or 0.0
             a, b, c = st.columns(3)
             v = a.number_input("Valor dos produtos (R$)", value=1000.0)
             i = b.number_input("IPI (R$)", value=0.0)
