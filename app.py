@@ -399,7 +399,9 @@ def analisar(ncm: str, uf_origem: str, uf_destino: str, regime: str) -> Ficha | 
                   pis="Incluso no DAS", cofins="Incluso no DAS",
                   base="LC 123/2006, art. 18 (+ Res. CGSN 140/2018)")
         if tipo == "monofasico":
-            pc["obs"] = "Monofasico: segregar a receita (PIS/COFINS ja recolhidos na origem)."
+            pc["obs"] = ("PIS/COFINS JA FORAM RECOLHIDOS na origem (regime monofasico - fabricante/"
+                         "importador). Segregue a receita no PGDAS-D para excluir essas "
+                         "contribuicoes do calculo do DAS.")
     elif tipo == "monofasico":
         pc = dict(regime=regime, pis="0% na revenda", cofins="0% na revenda",
                   base="Regime monofasico", obs=p["pis_cofins"]["obs"])
